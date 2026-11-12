@@ -6,18 +6,34 @@ SQLite database for users and generations
 import sqlite3
 import hashlib
 import secrets
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
+from werkzeug.security import generate_password_hash, check_password_hash
 
-DB_PATH = Path("v2fun_data/v2fun.db")
+BASE_DIR = Path(__file__).resolve().parent.parent
+V2FUN_DATA_DIR = BASE_DIR / "v2fun_data"
+DB_PATH = V2FUN_DATA_DIR / "v2fun.db"
 
 
 def get_db():
-    """Get database connection"""
+    """Get database connection with foreign keys and WAL mode enabled"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
+
+
+@contextmanager
+def db_session():
+    """Context manager that ensures SQLite connections are always closed."""
+    conn = get_db()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -138,6 +154,32 @@ def init_db():
             UNIQUE(user_id, service_name)
         )
     """)
+
+    # Backend API jobs table (persistent job & gallery history across restarts)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS backend_jobs (
+            id TEXT PRIMARY KEY,
+            prompt TEXT NOT NULL,
+            status TEXT NOT NULL,
+            source TEXT DEFAULT 'api',
+            account TEXT,
+            model TEXT,
+            quality TEXT,
+            ratio TEXT,
+            created_at TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            task_uuid TEXT,
+            work_url TEXT,
+            thumb TEXT,
+            local_path TEXT,
+            progress INTEGER DEFAULT 0,
+            poll_attempts INTEGER DEFAULT 0,
+            fallback_attempts_json TEXT DEFAULT '[]',
+            result_json TEXT,
+            error TEXT
+        )
+    """)
     
     conn.commit()
     conn.close()
@@ -163,7 +205,6 @@ def import_v2fun_account(email: str, password: str, user_id: int = None) -> bool
         """, (email, password, user_id))
         
         conn.commit()
-        conn.close()
         return True
     except sqlite3.IntegrityError:
         # Account already exists. Only reset to 'pending' if it was 'failed'
@@ -186,14 +227,14 @@ def import_v2fun_account(email: str, password: str, user_id: int = None) -> bool
             """, (user_id, email))
         
         conn.commit()
-        conn.close()
         # Return True only if we actually reset a failed account (retry case).
         # For 'done'/'pending' duplicates, return False (skipped).
         return reset_count > 0
     except Exception as e:
         print(f"Import error: {e}")
-        conn.close()
         return False
+    finally:
+        conn.close()
 
 
 def get_pending_accounts(user_id: int = None) -> list:
@@ -203,27 +244,23 @@ def get_pending_accounts(user_id: int = None) -> list:
     OR unowned accounts (user_id IS NULL). Accounts owned by OTHER users
     are not returned (they belong to that user's import queue).
     """
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    if user_id:
-        cursor.execute("""
-            SELECT id, email, password, status, created_at
-            FROM v2fun_accounts
-            WHERE status = 'pending' AND (user_id = ? OR user_id IS NULL)
-            ORDER BY created_at ASC
-        """, (user_id,))
-    else:
-        cursor.execute("""
-            SELECT id, email, password, status, created_at
-            FROM v2fun_accounts
-            WHERE status = 'pending'
-            ORDER BY created_at ASC
-        """)
-    
-    accounts = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return accounts
+    with db_session() as conn:
+        cursor = conn.cursor()
+        if user_id:
+            cursor.execute("""
+                SELECT id, email, password, status, created_at
+                FROM v2fun_accounts
+                WHERE status = 'pending' AND (user_id = ? OR user_id IS NULL)
+                ORDER BY created_at ASC
+            """, (user_id,))
+        else:
+            cursor.execute("""
+                SELECT id, email, password, status, created_at
+                FROM v2fun_accounts
+                WHERE status = 'pending'
+                ORDER BY created_at ASC
+            """)
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def get_all_v2fun_accounts(user_id: int = None) -> list:
@@ -235,76 +272,71 @@ def get_all_v2fun_accounts(user_id: int = None) -> list:
       logged-in V2Fun account, since the token is shared via session files).
     - If user_id is None (admin view): all accounts.
     """
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    if user_id:
-        cursor.execute("""
-            SELECT id, email, status, jwt_token, token_expiry, 
-                   error_message, created_at, processed_at
-            FROM v2fun_accounts
-            WHERE user_id = ? OR user_id IS NULL OR status = 'done'
-            ORDER BY created_at DESC
-        """, (user_id,))
-    else:
-        cursor.execute("""
-            SELECT id, email, status, jwt_token, token_expiry, 
-                   error_message, created_at, processed_at
-            FROM v2fun_accounts
-            ORDER BY created_at DESC
-        """)
-    
-    accounts = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return accounts
+    with db_session() as conn:
+        cursor = conn.cursor()
+        if user_id:
+            cursor.execute("""
+                SELECT id, email, status, jwt_token, token_expiry, 
+                       error_message, created_at, processed_at
+                FROM v2fun_accounts
+                WHERE user_id = ? OR user_id IS NULL OR status = 'done'
+                ORDER BY created_at DESC
+            """, (user_id,))
+        else:
+            cursor.execute("""
+                SELECT id, email, status, jwt_token, token_expiry, 
+                       error_message, created_at, processed_at
+                FROM v2fun_accounts
+                ORDER BY created_at DESC
+            """)
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def update_v2fun_account_status(account_id: int, status: str, 
                                  jwt_token: str = None, token_expiry: str = None,
                                  error_message: str = None):
     """Update V2Fun account status after processing"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        UPDATE v2fun_accounts
-        SET status = ?, jwt_token = ?, token_expiry = ?, 
-            error_message = ?, processed_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (status, jwt_token, token_expiry, error_message, account_id))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE v2fun_accounts
+            SET status = ?, jwt_token = ?, token_expiry = ?, 
+                error_message = ?, processed_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (status, jwt_token, token_expiry, error_message, account_id))
+        conn.commit()
 
 
-def delete_v2fun_account(account_id: int):
-    """Delete a V2Fun account"""
+def delete_v2fun_account(account_id: int, user_id: int = None) -> bool:
+    """Delete a V2Fun account (scoped to user_id if provided, allowing unowned rows)"""
     conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("DELETE FROM v2fun_accounts WHERE id = ?", (account_id,))
-    
-    conn.commit()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        if user_id is not None:
+            cursor.execute(
+                "DELETE FROM v2fun_accounts WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
+                (account_id, user_id),
+            )
+        else:
+            cursor.execute("DELETE FROM v2fun_accounts WHERE id = ?", (account_id,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        return deleted
+    finally:
+        conn.close()
 
 
 def get_v2fun_account_by_id(account_id: int) -> dict:
     """Get V2Fun account by ID"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id, email, password, status, jwt_token, token_expiry, created_at
-        FROM v2fun_accounts
-        WHERE id = ?
-    """, (account_id,))
-    
-    account = cursor.fetchone()
-    conn.close()
-    
-    if account:
-        return dict(account)
-    return None
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, email, password, status, jwt_token, token_expiry, created_at
+            FROM v2fun_accounts
+            WHERE id = ?
+        """, (account_id,))
+        account = cursor.fetchone()
+        return dict(account) if account else None
 
 
 def upsert_v2fun_account_from_session(email: str, jwt_token: str,
@@ -329,7 +361,6 @@ def upsert_v2fun_account_from_session(email: str, jwt_token: str,
             VALUES (?, ?, ?, 'done', ?, ?, CURRENT_TIMESTAMP)
         """, (email, "", user_id, jwt_token, token_expiry))
         conn.commit()
-        conn.close()
         return True
     except sqlite3.IntegrityError:
         # Account exists — update token/status only if it's better than current
@@ -349,12 +380,12 @@ def upsert_v2fun_account_from_session(email: str, jwt_token: str,
             """, (user_id, email))
         
         conn.commit()
-        conn.close()
         return True
     except Exception as e:
         print(f"Upsert session error: {e}")
-        conn.close()
         return False
+    finally:
+        conn.close()
 
 
 def sync_v2fun_sessions_to_db(user_id: int = None) -> int:
@@ -369,7 +400,7 @@ def sync_v2fun_sessions_to_db(user_id: int = None) -> int:
     import json
     from pathlib import Path
     
-    v2fun_data = Path("v2fun_data")
+    v2fun_data = V2FUN_DATA_DIR
     if not v2fun_data.exists():
         return 0
     
@@ -414,378 +445,438 @@ def sync_v2fun_sessions_to_db(user_id: int = None) -> int:
 
 
 def hash_password(password: str) -> str:
-    """Hash password with SHA-256"""
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Hash password securely with salted PBKDF2/scrypt via Werkzeug"""
+    return generate_password_hash(password)
+
+
+def _is_legacy_sha256(stored_hash: str) -> bool:
+    return bool(stored_hash) and len(stored_hash) == 64 and all(c in "0123456789abcdef" for c in stored_hash.lower())
 
 
 def create_user(email: str, password: str, google_email: str = None) -> int:
     """Create a new user"""
     conn = get_db()
-    cursor = conn.cursor()
-    
-    password_hash = hash_password(password)
-    
     try:
+        cursor = conn.cursor()
+        password_hash = hash_password(password)
         cursor.execute("""
             INSERT INTO users (email, password_hash, google_email)
             VALUES (?, ?, ?)
         """, (email, password_hash, google_email))
-        
         conn.commit()
-        user_id = cursor.lastrowid
-        conn.close()
-        return user_id
+        return cursor.lastrowid
     except sqlite3.IntegrityError:
-        conn.close()
         return None
+    finally:
+        conn.close()
 
 
 def verify_user(email: str, password: str) -> dict:
-    """Verify user credentials"""
+    """Verify user credentials (supports transparent upgrade from legacy SHA-256)"""
     conn = get_db()
-    cursor = conn.cursor()
-    
-    password_hash = hash_password(password)
-    
-    cursor.execute("""
-        SELECT id, email, google_email, v2fun_token, credits
-        FROM users
-        WHERE email = ? AND password_hash = ?
-    """, (email, password_hash))
-    
-    user = cursor.fetchone()
-    conn.close()
-    
-    if user:
-        return dict(user)
-    return None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, email, password_hash, google_email, v2fun_token, credits
+            FROM users
+            WHERE email = ?
+        """, (email,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        user = dict(row)
+        stored_hash = user.pop("password_hash", "")
+        valid = False
+
+        if stored_hash.startswith(("scrypt:", "pbkdf2:")):
+            valid = check_password_hash(stored_hash, password)
+        elif _is_legacy_sha256(stored_hash):
+            legacy_hash = hashlib.sha256(password.encode()).hexdigest()
+            if secrets.compare_digest(stored_hash, legacy_hash):
+                valid = True
+                # Transparently upgrade legacy SHA-256 hash to salted hash
+                cursor.execute(
+                    "UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (hash_password(password), user["id"]),
+                )
+                conn.commit()
+
+        return user if valid else None
+    finally:
+        conn.close()
 
 
 def get_user_by_id(user_id: int) -> dict:
     """Get user by ID"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id, email, google_email, v2fun_token, v2fun_user_id, credits, created_at
-        FROM users
-        WHERE id = ?
-    """, (user_id,))
-    
-    user = cursor.fetchone()
-    conn.close()
-    
-    if user:
-        return dict(user)
-    return None
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, email, google_email, v2fun_token, v2fun_user_id, credits, created_at
+            FROM users
+            WHERE id = ?
+        """, (user_id,))
+        user = cursor.fetchone()
+        return dict(user) if user else None
 
 
 def update_user_token(user_id: int, v2fun_token: str, v2fun_user_id: str = None):
     """Update user's V2Fun token"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        UPDATE users
-        SET v2fun_token = ?, v2fun_user_id = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (v2fun_token, v2fun_user_id, user_id))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE users
+            SET v2fun_token = ?, v2fun_user_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (v2fun_token, v2fun_user_id, user_id))
+        conn.commit()
 
 
 def create_generation(user_id: int, prompt: str, **kwargs) -> int:
     """Create a new generation record"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO generations (
-            user_id, prompt, model, quality, ratio, num, 
-            reference_image, task_uuid, work_area_id, task_ids, status
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        user_id,
-        prompt,
-        kwargs.get('model', 'nano-banana-pro'),
-        kwargs.get('quality', 'medium'),
-        kwargs.get('ratio', '16:9'),
-        kwargs.get('num', 1),
-        kwargs.get('reference_image'),
-        kwargs.get('task_uuid'),
-        kwargs.get('work_area_id'),
-        kwargs.get('task_ids'),
-        'pending'
-    ))
-    
-    conn.commit()
-    generation_id = cursor.lastrowid
-    conn.close()
-    return generation_id
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO generations (
+                user_id, prompt, model, quality, ratio, num, 
+                reference_image, task_uuid, work_area_id, task_ids, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            prompt,
+            kwargs.get('model', 'nano-banana-pro'),
+            kwargs.get('quality', 'medium'),
+            kwargs.get('ratio', '16:9'),
+            kwargs.get('num', 1),
+            kwargs.get('reference_image'),
+            kwargs.get('task_uuid'),
+            kwargs.get('work_area_id'),
+            kwargs.get('task_ids'),
+            'pending'
+        ))
+        conn.commit()
+        return cursor.lastrowid
 
 
 def update_generation_status(generation_id: int, status: str, result_url: str = None, 
                              thumbnail_url: str = None, error_message: str = None,
                              local_path: str = None):
     """Update generation status"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        UPDATE generations
-        SET status = ?, result_url = ?, thumbnail_url = ?, 
-            error_message = ?, local_path = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-    """, (status, result_url, thumbnail_url, error_message, local_path, generation_id))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE generations
+            SET status = ?, result_url = ?, thumbnail_url = ?, 
+                error_message = ?, local_path = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (status, result_url, thumbnail_url, error_message, local_path, generation_id))
+        conn.commit()
 
 
 def get_user_generations(user_id: int, limit: int = 20) -> list:
     """Get user's generation history"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id, prompt, model, quality, ratio, num, status, 
-               result_url, thumbnail_url, local_path, task_uuid, created_at
-        FROM generations
-        WHERE user_id = ?
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (user_id, limit))
-    
-    generations = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return generations
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, prompt, model, quality, ratio, num, status, 
+                   result_url, thumbnail_url, local_path, task_uuid, created_at
+            FROM generations
+            WHERE user_id = ?
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (user_id, limit))
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def get_all_generations(limit: int = 50) -> list:
     """Get all generations (admin view)"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT g.id, g.prompt, g.status, g.created_at, u.email
-        FROM generations g
-        JOIN users u ON g.user_id = u.id
-        ORDER BY g.created_at DESC
-        LIMIT ?
-    """, (limit,))
-    
-    generations = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return generations
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT g.id, g.prompt, g.status, g.created_at, u.email
+            FROM generations g
+            JOIN users u ON g.user_id = u.id
+            ORDER BY g.created_at DESC
+            LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def save_uploaded_image(user_id: int, filename: str, original_filename: str, 
                        file_path: str, file_size: int, mime_type: str) -> int:
     """Save uploaded image record"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO uploaded_images (
-            user_id, filename, original_filename, file_path, file_size, mime_type
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (user_id, filename, original_filename, file_path, file_size, mime_type))
-    
-    conn.commit()
-    image_id = cursor.lastrowid
-    conn.close()
-    return image_id
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO uploaded_images (
+                user_id, filename, original_filename, file_path, file_size, mime_type
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (user_id, filename, original_filename, file_path, file_size, mime_type))
+        conn.commit()
+        return cursor.lastrowid
 
 
 def create_session(user_id: int, expires_in_days: int = 7) -> str:
-    """Create a login session"""
+    """Create a login session (stored in UTC to match SQLite CURRENT_TIMESTAMP)"""
     from datetime import timedelta
     
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    session_token = secrets.token_urlsafe(32)
-    expires_at = datetime.now() + timedelta(days=expires_in_days)
-    
-    cursor.execute("""
-        INSERT INTO sessions (user_id, session_token, expires_at)
-        VALUES (?, ?, ?)
-    """, (user_id, session_token, expires_at))
-    
-    conn.commit()
-    conn.close()
-    return session_token
+    with db_session() as conn:
+        cursor = conn.cursor()
+        session_token = secrets.token_urlsafe(32)
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=expires_in_days)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        cursor.execute("""
+            INSERT INTO sessions (user_id, session_token, expires_at)
+            VALUES (?, ?, ?)
+        """, (user_id, session_token, expires_at))
+        
+        conn.commit()
+        return session_token
 
 
 def verify_session(session_token: str) -> dict:
     """Verify session token"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT s.user_id, u.email, u.v2fun_token, u.credits
-        FROM sessions s
-        JOIN users u ON s.user_id = u.id
-        WHERE s.session_token = ? AND s.expires_at > CURRENT_TIMESTAMP
-    """, (session_token,))
-    
-    session = cursor.fetchone()
-    conn.close()
-    
-    if session:
-        return dict(session)
-    return None
+    with db_session() as conn:
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT s.user_id, u.email, u.v2fun_token, u.credits
+            FROM sessions s
+            JOIN users u ON s.user_id = u.id
+            WHERE s.session_token = ? AND s.expires_at > CURRENT_TIMESTAMP
+        """, (session_token,))
+        
+        session = cursor.fetchone()
+        return dict(session) if session else None
 
 
 def delete_session(session_token: str):
     """Delete a session (logout)"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("DELETE FROM sessions WHERE session_token = ?", (session_token,))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM sessions WHERE session_token = ?", (session_token,))
+        conn.commit()
+
+
+def cleanup_expired_sessions() -> int:
+    """Remove expired login sessions from the database."""
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP")
+        deleted = cursor.rowcount
+        conn.commit()
+        return deleted
 
 
 def update_quota_snapshot(email: str, total_free: int, total_used: int, quota_json: str, status: str = 'online', error_message: str = None):
     """Update or insert quota snapshot for an account"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO quota_snapshots (email, total_free, total_used, quota_json, status, error_message, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(email) DO UPDATE SET
-            total_free = excluded.total_free,
-            total_used = excluded.total_used,
-            quota_json = excluded.quota_json,
-            status = excluded.status,
-            error_message = excluded.error_message,
-            updated_at = CURRENT_TIMESTAMP
-    """, (email, total_free, total_used, quota_json, status, error_message))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO quota_snapshots (email, total_free, total_used, quota_json, status, error_message, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(email) DO UPDATE SET
+                total_free = excluded.total_free,
+                total_used = excluded.total_used,
+                quota_json = excluded.quota_json,
+                status = excluded.status,
+                error_message = excluded.error_message,
+                updated_at = CURRENT_TIMESTAMP
+        """, (email, total_free, total_used, quota_json, status, error_message))
+        conn.commit()
 
 
 def get_all_quota_snapshots():
     """Get all quota snapshots from database"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT email, total_free, total_used, quota_json, status, error_message, updated_at
-        FROM quota_snapshots
-        ORDER BY total_free DESC
-    """)
-    
-    rows = cursor.fetchall()
-    conn.close()
-    
-    return [dict(row) for row in rows]
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT email, total_free, total_used, quota_json, status, error_message, updated_at
+            FROM quota_snapshots
+            ORDER BY total_free DESC
+        """)
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def get_quota_snapshot(email: str):
     """Get quota snapshot for a specific account"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT email, total_free, total_used, quota_json, status, error_message, updated_at
-        FROM quota_snapshots
-        WHERE email = ?
-    """, (email,))
-    
-    row = cursor.fetchone()
-    conn.close()
-    
-    return dict(row) if row else None
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT email, total_free, total_used, quota_json, status, error_message, updated_at
+            FROM quota_snapshots
+            WHERE email = ?
+        """, (email,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
 
 def save_integration(user_id: int, service_name: str, base_url: str, api_key: str):
     """Save or update integration settings for a user"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO integrations (user_id, service_name, base_url, api_key, updated_at)
-        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id, service_name) DO UPDATE SET
-            base_url = excluded.base_url,
-            api_key = excluded.api_key,
-            updated_at = CURRENT_TIMESTAMP
-    """, (user_id, service_name, base_url, api_key))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO integrations (user_id, service_name, base_url, api_key, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id, service_name) DO UPDATE SET
+                base_url = excluded.base_url,
+                api_key = excluded.api_key,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, service_name, base_url, api_key))
+        conn.commit()
 
 
 def get_integration(user_id: int, service_name: str):
     """Get integration settings for a user and service"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id, service_name, base_url, api_key, is_active, created_at, updated_at
-        FROM integrations
-        WHERE user_id = ? AND service_name = ?
-    """, (user_id, service_name))
-    
-    row = cursor.fetchone()
-    conn.close()
-    
-    return dict(row) if row else None
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, service_name, base_url, api_key, is_active, created_at, updated_at
+            FROM integrations
+            WHERE user_id = ? AND service_name = ?
+        """, (user_id, service_name))
+        row = cursor.fetchone()
+        return dict(row) if row else None
 
 
 def get_all_integrations(user_id: int):
     """Get all integrations for a user"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT id, service_name, base_url, api_key, is_active, created_at, updated_at
-        FROM integrations
-        WHERE user_id = ?
-        ORDER BY service_name
-    """, (user_id,))
-    
-    rows = cursor.fetchall()
-    conn.close()
-    
-    return [dict(row) for row in rows]
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, service_name, base_url, api_key, is_active, created_at, updated_at
+            FROM integrations
+            WHERE user_id = ?
+            ORDER BY service_name
+        """, (user_id,))
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def delete_integration(user_id: int, service_name: str):
     """Delete integration settings"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        DELETE FROM integrations
-        WHERE user_id = ? AND service_name = ?
-    """, (user_id, service_name))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM integrations
+            WHERE user_id = ? AND service_name = ?
+        """, (user_id, service_name))
+        conn.commit()
 
 
 def toggle_integration(user_id: int, service_name: str, is_active: bool):
     """Enable or disable an integration"""
-    conn = get_db()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        UPDATE integrations
-        SET is_active = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE user_id = ? AND service_name = ?
-    """, (1 if is_active else 0, user_id, service_name))
-    
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE integrations
+            SET is_active = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND service_name = ?
+        """, (1 if is_active else 0, user_id, service_name))
+        conn.commit()
+
+
+def save_backend_job(job: dict):
+    """Insert or update a Backend API job in SQLite."""
+    import json
+
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO backend_jobs (
+                id, prompt, status, source, account, model, quality, ratio,
+                created_at, started_at, completed_at, task_uuid, work_url,
+                thumb, local_path, progress, poll_attempts,
+                fallback_attempts_json, result_json, error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                account = excluded.account,
+                model = excluded.model,
+                started_at = excluded.started_at,
+                completed_at = excluded.completed_at,
+                task_uuid = excluded.task_uuid,
+                work_url = excluded.work_url,
+                thumb = excluded.thumb,
+                local_path = excluded.local_path,
+                progress = excluded.progress,
+                poll_attempts = excluded.poll_attempts,
+                fallback_attempts_json = excluded.fallback_attempts_json,
+                result_json = excluded.result_json,
+                error = excluded.error
+        """, (
+            job["id"],
+            job.get("prompt", ""),
+            job.get("status", "queued"),
+            job.get("source", "api"),
+            job.get("account"),
+            job.get("model"),
+            job.get("quality"),
+            job.get("ratio"),
+            job.get("created_at"),
+            job.get("started_at"),
+            job.get("completed_at"),
+            job.get("task_uuid"),
+            job.get("work_url"),
+            job.get("thumb"),
+            job.get("local_path"),
+            job.get("progress", 0),
+            job.get("poll_attempts", 0),
+            json.dumps(job.get("fallback_attempts", [])),
+            json.dumps(job["result"]) if job.get("result") is not None else None,
+            job.get("error"),
+        ))
+        conn.commit()
+
+
+def _row_to_backend_job(row) -> dict:
+    import json
+
+    data = dict(row)
+    try:
+        data["fallback_attempts"] = json.loads(data.pop("fallback_attempts_json") or "[]")
+    except Exception:
+        data["fallback_attempts"] = []
+    raw_res = data.pop("result_json", None)
+    try:
+        data["result"] = json.loads(raw_res) if raw_res else None
+    except Exception:
+        data["result"] = None
+    return data
+
+
+def get_backend_job(job_id: str) -> dict:
+    """Fetch a single Backend API job by ID."""
+    with db_session() as conn:
+        row = conn.execute("SELECT * FROM backend_jobs WHERE id = ?", (job_id,)).fetchone()
+        return _row_to_backend_job(row) if row else None
+
+
+def list_backend_jobs(status: str = None, limit: int = 50) -> list:
+    """List Backend API jobs ordered by created_at DESC."""
+    with db_session() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM backend_jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM backend_jobs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [_row_to_backend_job(r) for r in rows]
+
+
+def delete_backend_job(job_id: str) -> bool:
+    """Delete a Backend API job by ID."""
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM backend_jobs WHERE id = ?", (job_id,))
+        deleted = cursor.rowcount > 0
+        conn.commit()
+        return deleted
 
 
 if __name__ == "__main__":

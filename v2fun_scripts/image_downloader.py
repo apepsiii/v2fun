@@ -10,6 +10,10 @@ from datetime import datetime
 from typing import Optional
 
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+RESULTS_DIR = BASE_DIR / "v2fun_data" / "results"
+
+
 def download_image(image_url: str, generation_id, prompt: str = "") -> Optional[str]:
     """
     Download image from V2Fun CDN to local storage
@@ -24,7 +28,7 @@ def download_image(image_url: str, generation_id, prompt: str = "") -> Optional[
     """
     try:
         # Create downloads directory
-        download_dir = Path("v2fun_data/results")
+        download_dir = RESULTS_DIR
         download_dir.mkdir(parents=True, exist_ok=True)
         
         # Generate filename
@@ -34,10 +38,11 @@ def download_image(image_url: str, generation_id, prompt: str = "") -> Optional[
         safe_prompt = "".join(c for c in prompt[:50] if c.isalnum() or c in (' ', '-', '_')).strip()
         safe_prompt = safe_prompt.replace(' ', '_')
         
-        # Get file extension from URL
+        # Get file extension from URL (strip query string)
         ext = '.jpg'  # default
-        if '.' in image_url.split('/')[-1]:
-            url_ext = image_url.split('/')[-1].split('.')[-1].lower()
+        url_path = image_url.split('?')[0].split('/')[-1]
+        if '.' in url_path:
+            url_ext = url_path.split('.')[-1].lower()
             if url_ext in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
                 ext = '.' + url_ext
         
@@ -58,8 +63,8 @@ def download_image(image_url: str, generation_id, prompt: str = "") -> Optional[
             for chunk in response.iter_content(chunk_size=8192):
                 f.write(chunk)
         
-        # Return relative path from project root
-        return str(filepath.relative_to(Path.cwd()))
+        # Return path relative to project root
+        return str(filepath.relative_to(BASE_DIR))
         
     except Exception as e:
         print(f"Failed to download image {image_url}: {e}")
@@ -68,7 +73,7 @@ def download_image(image_url: str, generation_id, prompt: str = "") -> Optional[
 
 def get_local_image_path(generation_id: int) -> Optional[str]:
     """Get local path for a generation if it exists"""
-    download_dir = Path("v2fun_data/results")
+    download_dir = RESULTS_DIR
     if not download_dir.exists():
         return None
     
@@ -77,7 +82,7 @@ def get_local_image_path(generation_id: int) -> Optional[str]:
     matches = list(download_dir.glob(pattern))
     
     if matches:
-        return str(matches[0].relative_to(Path.cwd()))
+        return str(matches[0].relative_to(BASE_DIR))
     
     return None
 
@@ -86,7 +91,7 @@ def cleanup_old_images(days: int = 30):
     """Delete images older than specified days"""
     from datetime import timedelta
     
-    download_dir = Path("v2fun_data/results")
+    download_dir = RESULTS_DIR
     if not download_dir.exists():
         return 0
     

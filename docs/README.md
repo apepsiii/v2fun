@@ -9,17 +9,14 @@ Organized documentation for V2Fun.ai Backend API project.
 ```
 v2fun/
 ├── docs/
+│   ├── api/                       # API guides & quick references
+│   ├── archive/                   # Historical summaries & cleanup notes
 │   ├── backend-enhancements/      # Backend API Enhancement docs
-│   │   ├── README.md
-│   │   ├── BACKEND_ENHANCEMENT_PLAN.md
-│   │   ├── BACKEND_ENHANCEMENT_IMPLEMENTATION.md
-│   │   ├── DEPLOYMENT_CHECKLIST.md
-│   │   └── IMPLEMENTATION_COMPLETE.txt
-│   │
-│   └── sessions/                  # Development session notes
-│       ├── SESSION_SUMMARY_20260831.md
-│       ├── VPS_UPDATE_SUMMARY.md
-│       └── MERGE_PLAN.md
+│   ├── fixes/                     # Consolidated bugfix & troubleshooting log
+│   │   └── FIXES_SUMMARY.md
+│   ├── guides/                    # Admin, CLI, and automation guides
+│   ├── sessions/                  # Development session notes
+│   └── technical/                 # Token refresh & GSuite flow diagrams
 │
 ├── AGENTS.md                      # Main project agents documentation
 ├── AGENTS-DEPLOY.md               # Deployment guide

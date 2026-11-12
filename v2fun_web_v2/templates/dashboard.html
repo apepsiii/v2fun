@@ -379,7 +379,7 @@
         <div class="card">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:var(--space-4)">
                 <div class="card-title" style="margin:0">Accounts Usage Monitor</div>
-                <button class="btn btn-primary btn-sm" onclick="refreshDashboard()">
+                <button class="btn btn-primary btn-sm" onclick="refreshDashboard(event)">
                     <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin-right:4px">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
                     </svg>
@@ -603,12 +603,17 @@
         
         <!-- Step 2: Account List & Process -->
         <div class="card" id="accountListCard" style="display:none">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:8px;flex-wrap:wrap">
                 <div class="card-title" style="margin-bottom:0">Step 2: Process Accounts</div>
-                <button class="btn btn-accent btn-sm" id="processAllBtn" onclick="processAllAccounts()">
-                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
-                    Process All Pending
-                </button>
+                <div style="display:flex;gap:8px;align-items:center">
+                    <button class="btn btn-outline btn-sm" id="bulkDeleteV2FunBtn" onclick="bulkDeleteV2FunAccounts()" style="display:none;border-color:var(--color-destructive);color:var(--color-destructive)">
+                        Delete Selected (<span id="v2funSelectedCount">0</span>)
+                    </button>
+                    <button class="btn btn-accent btn-sm" id="processAllBtn" onclick="processAllAccounts()">
+                        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
+                        Process All Pending
+                    </button>
+                </div>
             </div>
             <div id="accountListTable">
                 <p style="color:#94a3b8;text-align:center;padding:20px">No accounts imported yet</p>
@@ -656,12 +661,21 @@
         </div>
         
         <div class="card">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:8px;flex-wrap:wrap">
                 <div class="card-title" style="margin-bottom:0">All V2Fun Sessions</div>
-                <button class="btn btn-outline btn-sm" onclick="loadManagedAccounts()">
-                    <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
-                    Refresh
-                </button>
+                <div style="display:flex;gap:8px;flex-wrap:wrap">
+                    <button class="btn btn-outline btn-sm" id="bulkDeleteManagedBtn" onclick="bulkDeleteManagedAccounts()" style="display:none;border-color:var(--color-destructive);color:var(--color-destructive)">
+                        Delete Selected (<span id="managedSelectedCount">0</span>)
+                    </button>
+                    <button class="btn btn-primary btn-sm" onclick="refreshAllExpiringTokens()">
+                        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                        Refresh Expiring Tokens
+                    </button>
+                    <button class="btn btn-outline btn-sm" onclick="loadManagedAccounts()">
+                        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+                        Refresh
+                    </button>
+                </div>
             </div>
             <div id="manageTable">
                 <p style="color:#94a3b8;text-align:center;padding:40px">Loading...</p>
@@ -730,6 +744,16 @@
     let currentPage = 'dashboard';
     let uploadedImages = [null, null, null];  // Array for up to 3 OSS paths
 
+    function escapeHtml(value) {
+        if (value === null || value === undefined) return '';
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
     // Init
     window.addEventListener('DOMContentLoaded', async () => {
         await loadUser();
@@ -737,6 +761,11 @@
         await loadGallery();
         await loadRecentGenerations();
         await loadDashboard();
+        await loadAccountList();
+        const savedPage = sessionStorage.getItem('v2fun_current_page');
+        if (savedPage && document.getElementById('page-' + savedPage)) {
+            showPage(savedPage);
+        }
     });
 
     async function loadUser() {
@@ -791,7 +820,7 @@
             }
             
             select.innerHTML = '<option value="">-- Select V2Fun Account --</option>' +
-                data.sessions.map(s => `<option value="${s.email}" ${s.email === currentEmail ? 'selected' : ''}>${s.email}</option>`).join('');
+                data.sessions.map(s => `<option value="${escapeHtml(s.email)}" ${s.email === currentEmail ? 'selected' : ''}>${escapeHtml(s.email)}</option>`).join('');
             
             if (dot) dot.style.background = currentEmail ? '#10b981' : '#94a3b8';
         } else {
@@ -835,11 +864,13 @@
         
         if (data.sessions && data.sessions.length > 0) {
             select.innerHTML = '<option value="">-- Select session --</option>' +
-                data.sessions.map(s => `<option value="${s.email}">${s.email}</option>`).join('');
+                data.sessions.map(s => `<option value="${escapeHtml(s.email)}">${escapeHtml(s.email)}</option>`).join('');
         } else {
             select.innerHTML = '<option value="">No sessions found - add an account below</option>';
         }
     }
+
+    let galleryPollTimer = null;
 
     async function loadGallery() {
         const resp = await fetch('/api/generations');
@@ -852,15 +883,26 @@
         // Update stats
         document.getElementById('statTotal').textContent = gens.length;
         document.getElementById('statDone').textContent = gens.filter(g => g.status === 'done').length;
-        document.getElementById('statPending').textContent = gens.filter(g => g.status === 'pending').length;
+        document.getElementById('statPending').textContent = gens.filter(g => g.status === 'pending' || g.status === 'processing').length;
         
         const grid = document.getElementById('galleryGrid');
         if (gens.length === 0) {
             grid.innerHTML = '<p style="color:#94a3b8;grid-column:1/-1;text-align:center;padding:40px">No generations yet. Start generating!</p>';
-            return;
+        } else {
+            grid.innerHTML = gens.map(g => renderGalleryItem(g)).join('');
         }
-        
-        grid.innerHTML = gens.map(g => renderGalleryItem(g)).join('');
+
+        // Auto-refresh while any generation is still running in the background
+        const hasActive = gens.some(g => g.status === 'pending' || g.status === 'processing');
+        if (hasActive && !galleryPollTimer) {
+            galleryPollTimer = setInterval(async () => {
+                await loadGallery();
+                await loadRecentGenerations();
+            }, 5000);
+        } else if (!hasActive && galleryPollTimer) {
+            clearInterval(galleryPollTimer);
+            galleryPollTimer = null;
+        }
     }
 
     async function loadRecentGenerations() {
@@ -884,8 +926,12 @@
             'failed': '<span class="badge badge-failed">Failed</span>',
         }[g.status] || '<span class="badge badge-pending">Pending</span>';
         
-        const imageHtml = g.result_url
-            ? `<img src="${g.result_url}" alt="${g.prompt}" style="width:100%;height:100%;object-fit:cover" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">
+        const safePrompt = escapeHtml(g.prompt);
+        const localSrc = g.local_url || (g.local_path ? '/results/' + g.local_path.split(/[\\/]/).pop() : '');
+        const resolvedUrl = localSrc || g.result_url || '';
+        const safeUrl = escapeHtml(resolvedUrl);
+        const imageHtml = resolvedUrl
+            ? `<a href="${safeUrl}" target="_blank" style="display:block;width:100%;height:100%"><img src="${safeUrl}" alt="${safePrompt}" style="width:100%;height:100%;object-fit:cover" loading="lazy" onerror="this.style.display='none';this.parentElement.nextElementSibling.style.display='flex'"></a>
                <div style="display:none;width:100%;height:100%;align-items:center;justify-content:center;color:#94a3b8;background:var(--color-muted)"><svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/></svg></div>`
             : g.status === 'pending' || g.status === 'processing'
                 ? `<div style="display:flex;flex-direction:column;align-items:center;gap:8px;color:#94a3b8"><div class="spinner" style="width:24px;height:24px;border-width:2px"></div><span style="font-size:11px">Processing...</span></div>`
@@ -899,11 +945,12 @@
                     ${imageHtml}
                 </div>
                 <div class="gallery-item-info">
-                    <div class="gallery-item-prompt" title="${g.prompt}">${g.prompt}</div>
+                    <div class="gallery-item-prompt" title="${safePrompt}">${safePrompt}</div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
                         ${statusBadge}
                         <span class="gallery-item-meta">${date}</span>
                     </div>
+                    ${resolvedUrl ? `<div style="display:flex;gap:4px;margin-top:8px"><a href="${safeUrl}" target="_blank" class="btn btn-primary btn-sm" style="flex:1;justify-content:center;font-size:11px;padding:4px 8px">Open</a><a href="${safeUrl}" download class="btn btn-outline btn-sm" style="flex:1;justify-content:center;font-size:11px;padding:4px 8px">Download</a></div>` : ''}
                 </div>
             </div>`;
     }
@@ -926,7 +973,7 @@
                 slot.innerHTML = `
                     <img src="${ev.target.result}" alt="Preview" style="width:100%;height:100%;object-fit:cover">
                     <button onclick="removeSlotImage(${slotIdx})" style="position:absolute;top:4px;right:4px;width:20px;height:20px;background:var(--color-destructive);color:white;border-radius:50%;border:none;cursor:pointer;font-size:12px;line-height:20px;z-index:10">×</button>
-                    <div style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.6);color:white;font-size:9px;padding:2px 4px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${file.name}</div>`;
+                    <div style="position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,0.6);color:white;font-size:9px;padding:2px 4px;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(file.name)}</div>`;
                 slot.style.borderColor = 'var(--color-primary)';
                 slot.style.borderStyle = 'solid';
             };
@@ -977,6 +1024,7 @@
     function resetSlot(idx) {
         const slot = document.getElementById(`slot-${idx}`);
         slot.innerHTML = `
+            <input type="file" class="slot-input" data-slot="${idx}" accept="image/*" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%">
             <div class="slot-placeholder" style="text-align:center;color:#94a3b8">
                 <svg width="32" height="32" fill="none" stroke="currentColor" viewBox="0 0 24 24" style="margin:0 auto 4px"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/></svg>
                 <span style="font-size:11px">Image ${idx + 1}</span>
@@ -988,15 +1036,6 @@
     function removeSlotImage(idx) {
         uploadedImages[idx] = null;
         resetSlot(idx);
-        // Re-add input
-        const slot = document.getElementById(`slot-${idx}`);
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.className = 'slot-input';
-        input.dataset.slot = idx;
-        input.accept = 'image/*';
-        input.style.cssText = 'position:absolute;inset:0;opacity:0;cursor:pointer;width:100%;height:100%';
-        slot.appendChild(input);
     }
 
     async function generateImage() {
@@ -1126,13 +1165,17 @@
         
         if (!data.success || !data.accounts || data.accounts.length === 0) {
             div.innerHTML = '<p style="color:#94a3b8;text-align:center;padding:40px">No V2Fun accounts found. Register some first.</p>';
+            updateManagedSelection();
             return;
         }
         
         div.innerHTML = `
             <table class="accounts-table">
                 <thead>
-                    <tr><th>#</th><th>Email</th><th>Token</th><th>Remaining</th><th>Actions</th></tr>
+                    <tr>
+                        <th style="width:36px"><input type="checkbox" id="selectAllManaged" onchange="toggleSelectAllManaged(this.checked)" title="Select all"></th>
+                        <th>#</th><th>Email</th><th>Token</th><th>Remaining</th><th>Actions</th>
+                    </tr>
                 </thead>
                 <tbody>
                     ${data.accounts.map((a, i) => {
@@ -1149,22 +1192,57 @@
                         
                         return `
                         <tr>
+                            <td><input type="checkbox" class="managed-checkbox" value="${escapeHtml(a.email)}" onchange="updateManagedSelection()"></td>
                             <td>${i+1}</td>
-                            <td style="font-size:13px">${a.email}</td>
+                            <td style="font-size:13px">${escapeHtml(a.email)}</td>
                             <td>${badge}</td>
-                            <td style="font-size:12px;color:#94a3b8">${t.remaining || 'N/A'}</td>
+                            <td style="font-size:12px;color:#94a3b8">${escapeHtml(t.remaining || 'N/A')}</td>
                             <td>
-                                <button class="btn btn-outline btn-sm" onclick="refreshToken('${a.email}')" style="margin-right:4px">
+                                <button class="btn btn-outline btn-sm" onclick="refreshToken('${escapeHtml(a.email)}')" style="margin-right:4px">
                                     <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
                                     Refresh
                                 </button>
-                                <button class="btn btn-outline btn-sm" onclick="retryAccount('${a.email}')" style="margin-right:4px">Retry</button>
-                                <button class="btn btn-outline btn-sm" onclick="deleteAccount('${a.email}')" style="border-color:var(--color-destructive);color:var(--color-destructive)">Delete</button>
+                                <button class="btn btn-outline btn-sm" onclick="retryAccount('${escapeHtml(a.email)}')" style="margin-right:4px">Retry</button>
+                                <button class="btn btn-outline btn-sm" onclick="deleteAccount('${escapeHtml(a.email)}')" style="border-color:var(--color-destructive);color:var(--color-destructive)">Delete</button>
                             </td>
                         </tr>`;
                     }).join('')}
                 </tbody>
             </table>`;
+        updateManagedSelection();
+    }
+
+    function toggleSelectAllManaged(checked) {
+        document.querySelectorAll('.managed-checkbox').forEach(cb => { cb.checked = checked; });
+        updateManagedSelection();
+    }
+
+    function updateManagedSelection() {
+        const all = document.querySelectorAll('.managed-checkbox');
+        const checked = document.querySelectorAll('.managed-checkbox:checked');
+        const btn = document.getElementById('bulkDeleteManagedBtn');
+        const countEl = document.getElementById('managedSelectedCount');
+        const selectAll = document.getElementById('selectAllManaged');
+        if (countEl) countEl.textContent = checked.length;
+        if (btn) btn.style.display = checked.length > 0 ? 'inline-flex' : 'none';
+        if (selectAll) selectAll.checked = all.length > 0 && checked.length === all.length;
+    }
+
+    async function bulkDeleteManagedAccounts() {
+        const emails = Array.from(document.querySelectorAll('.managed-checkbox:checked')).map(cb => cb.value);
+        if (emails.length === 0) return;
+        if (!confirm(`Delete ${emails.length} selected session(s)? This cannot be undone.`)) return;
+
+        const resp = await fetch('/api/bulk-delete-accounts', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({emails})
+        });
+        const data = await resp.json();
+        showAlert('alert-manage', data.message, data.success ? 'success' : 'error');
+        await loadManagedAccounts();
+        await loadSessions();
+        await loadAccountDropdown();
     }
 
     async function exportData() {
@@ -1225,6 +1303,27 @@
         } finally {
             if (loading) loading.style.display = 'none';
             event.target.value = '';
+        }
+    }
+
+    async function refreshAllExpiringTokens() {
+        showAlert('alert-manage', 'Refreshing all active tokens...', 'info');
+        try {
+            const resp = await fetch('/api/refresh-all-tokens', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({force: true})
+            });
+            const data = await resp.json();
+            if (data.success && data.summary) {
+                const s = data.summary;
+                showAlert('alert-manage', `Token check done: ${s.refreshed} refreshed, ${s.skipped} valid, ${s.failed} failed`, s.failed > 0 ? 'error' : 'success');
+                await loadManagedAccounts();
+            } else {
+                showAlert('alert-manage', data.message || 'Refresh failed', 'error');
+            }
+        } catch (err) {
+            showAlert('alert-manage', 'Refresh failed: ' + err.message, 'error');
         }
     }
 
@@ -1315,17 +1414,27 @@
         const resp = await fetch('/api/v2fun-accounts');
         const data = await resp.json();
         
+        const listCard = document.getElementById('accountListCard');
+        const resultsCard = document.getElementById('resultsCard');
         const tableDiv = document.getElementById('accountListTable');
         
         if (!data.success || !data.accounts || data.accounts.length === 0) {
+            if (listCard) listCard.style.display = 'none';
+            if (resultsCard) resultsCard.style.display = 'none';
             tableDiv.innerHTML = '<p style="color:#94a3b8;text-align:center;padding:20px">No accounts imported yet</p>';
+            updateV2FunSelection();
             return;
         }
+        
+        if (listCard) listCard.style.display = 'block';
         
         tableDiv.innerHTML = `
             <table class="accounts-table">
                 <thead>
-                    <tr><th>#</th><th>Email</th><th>Status</th><th>JWT Token</th><th>Actions</th></tr>
+                    <tr>
+                        <th style="width:36px"><input type="checkbox" id="selectAllV2Fun" onchange="toggleSelectAllV2Fun(this.checked)" title="Select all"></th>
+                        <th>#</th><th>Email</th><th>Status</th><th>JWT Token</th><th>Actions</th>
+                    </tr>
                 </thead>
                 <tbody>
                 ${data.accounts.map((a, i) => {
@@ -1334,15 +1443,16 @@
                         'processing': '<span class="badge badge-processing">Processing</span>',
                         'done': '<span class="badge badge-done">Done</span>',
                         'failed': '<span class="badge badge-failed">Failed</span>'
-                    }[a.status] || `<span class="badge badge-pending">${a.status}</span>`;
+                    }[a.status] || `<span class="badge badge-pending">${escapeHtml(a.status)}</span>`;
                     
                     return `
                     <tr id="row-${a.id}">
+                        <td><input type="checkbox" class="v2fun-checkbox" value="${a.id}" onchange="updateV2FunSelection()"></td>
                         <td>${i+1}</td>
-                        <td style="font-size:13px">${a.email}</td>
+                        <td style="font-size:13px">${escapeHtml(a.email)}</td>
                         <td>${badge}</td>
                         <td style="font-size:11px;font-family:monospace;color:#64748b;max-width:200px;overflow:hidden;text-overflow:ellipsis">
-                            ${a.jwt_token || '—'}
+                            ${escapeHtml(a.jwt_token) || '—'}
                         </td>
                         <td>
                             ${a.status === 'pending' || a.status === 'failed' 
@@ -1354,12 +1464,15 @@
                 }).join('')}
                 </tbody>
             </table>`;
+        updateV2FunSelection();
         
         // Show results card if any accounts are processed
         const hasDone = data.accounts.some(a => a.status === 'done');
         if (hasDone) {
             document.getElementById('resultsCard').style.display = 'block';
             loadResultsTable(data.accounts);
+        } else {
+            document.getElementById('resultsCard').style.display = 'none';
         }
     }
 
@@ -1452,6 +1565,37 @@
         await loadAccountList();
     }
 
+    function toggleSelectAllV2Fun(checked) {
+        document.querySelectorAll('.v2fun-checkbox').forEach(cb => { cb.checked = checked; });
+        updateV2FunSelection();
+    }
+
+    function updateV2FunSelection() {
+        const all = document.querySelectorAll('.v2fun-checkbox');
+        const checked = document.querySelectorAll('.v2fun-checkbox:checked');
+        const btn = document.getElementById('bulkDeleteV2FunBtn');
+        const countEl = document.getElementById('v2funSelectedCount');
+        const selectAll = document.getElementById('selectAllV2Fun');
+        if (countEl) countEl.textContent = checked.length;
+        if (btn) btn.style.display = checked.length > 0 ? 'inline-flex' : 'none';
+        if (selectAll) selectAll.checked = all.length > 0 && checked.length === all.length;
+    }
+
+    async function bulkDeleteV2FunAccounts() {
+        const accountIds = Array.from(document.querySelectorAll('.v2fun-checkbox:checked')).map(cb => parseInt(cb.value, 10));
+        if (accountIds.length === 0) return;
+        if (!confirm(`Delete ${accountIds.length} selected account(s)?`)) return;
+
+        const resp = await fetch('/api/bulk-delete-v2fun-accounts', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({account_ids: accountIds})
+        });
+        const data = await resp.json();
+        showAlert('alert-register', data.message, data.success ? 'success' : 'error');
+        await loadAccountList();
+    }
+
     function loadResultsTable(accounts) {
         const doneAccounts = accounts.filter(a => a.status === 'done');
         if (doneAccounts.length === 0) {
@@ -1468,10 +1612,10 @@
                 ${doneAccounts.map((a, i) => `
                     <tr>
                         <td>${i+1}</td>
-                        <td style="font-size:13px">${a.email}</td>
-                        <td style="font-size:11px;font-family:monospace;color:#64748b">${a.jwt_token || '—'}</td>
-                        <td style="font-size:12px">${a.token_expiry || '—'}</td>
-                        <td><button class="btn btn-primary btn-sm" onclick="connectV2FunByEmail('${a.email}')">Connect</button></td>
+                        <td style="font-size:13px">${escapeHtml(a.email)}</td>
+                        <td style="font-size:11px;font-family:monospace;color:#64748b">${escapeHtml(a.jwt_token) || '—'}</td>
+                        <td style="font-size:12px">${escapeHtml(a.token_expiry) || '—'}</td>
+                        <td><button class="btn btn-primary btn-sm" onclick="connectV2FunByEmail('${escapeHtml(a.email)}')">Connect</button></td>
                     </tr>
                 `).join('')}
                 </tbody>
@@ -1508,7 +1652,7 @@
             const data = await resp.json();
             
             if (!data.success) {
-                showAlert('integrations', data.message, 'error');
+                showAlert('alert-integrations', data.message, 'error');
                 return;
             }
             
@@ -1535,14 +1679,14 @@
                     <tbody>
                         ${integrations.map(i => `
                             <tr>
-                                <td style="font-weight:600">${i.service_name}</td>
-                                <td><code style="font-size:12px;color:#64748b">${i.base_url}</code></td>
-                                <td><code style="font-size:12px;color:#64748b">${i.api_key_masked}</code></td>
+                                <td style="font-weight:600">${escapeHtml(i.service_name)}</td>
+                                <td><code style="font-size:12px;color:#64748b">${escapeHtml(i.base_url)}</code></td>
+                                <td><code style="font-size:12px;color:#64748b">${escapeHtml(i.api_key_masked)}</code></td>
                                 <td>${i.is_active ? '<span class="badge badge-done">Active</span>' : '<span class="badge badge-pending">Inactive</span>'}</td>
                                 <td style="font-size:13px;color:#64748b">${new Date(i.updated_at).toLocaleDateString()}</td>
                                 <td>
-                                    <button class="btn btn-outline btn-sm" onclick="testIntegration('${i.service_name}')" style="margin-right:4px">Test</button>
-                                    <button class="btn btn-outline btn-sm" onclick="deleteIntegration('${i.service_name}')" style="color:var(--color-destructive)">Delete</button>
+                                    <button class="btn btn-outline btn-sm" onclick="testIntegration('${escapeHtml(i.service_name)}')" style="margin-right:4px">Test</button>
+                                    <button class="btn btn-outline btn-sm" onclick="deleteIntegration('${escapeHtml(i.service_name)}')" style="color:var(--color-destructive)">Delete</button>
                                 </td>
                             </tr>
                         `).join('')}
@@ -1552,7 +1696,7 @@
             
             container.innerHTML = html;
         } catch (err) {
-            showAlert('integrations', 'Failed to load integrations', 'error');
+            showAlert('alert-integrations', 'Failed to load integrations', 'error');
             console.error(err);
         }
     }
@@ -1574,35 +1718,35 @@
             const data = await resp.json();
             
             if (data.success) {
-                showAlert('integrations', data.message, 'success');
+                showAlert('alert-integrations', data.message, 'success');
                 document.getElementById('integrationForm').reset();
                 await loadIntegrations();
             } else {
-                showAlert('integrations', data.message, 'error');
+                showAlert('alert-integrations', data.message, 'error');
             }
         } catch (err) {
-            showAlert('integrations', 'Failed to save integration', 'error');
+            showAlert('alert-integrations', 'Failed to save integration', 'error');
             console.error(err);
         }
     }
 
     async function testIntegration(serviceName) {
         try {
-            showAlert('integrations', 'Testing connection...', 'info');
+            showAlert('alert-integrations', 'Testing connection...', 'info');
             
-            const resp = await fetch(`/api/integrations/${serviceName}/test`, {
+            const resp = await fetch(`/api/integrations/${encodeURIComponent(serviceName)}/test`, {
                 method: 'POST'
             });
             
             const data = await resp.json();
             
             if (data.success) {
-                showAlert('integrations', `✓ ${data.message}`, 'success');
+                showAlert('alert-integrations', `✓ ${data.message}`, 'success');
             } else {
-                showAlert('integrations', `✗ ${data.message}`, 'error');
+                showAlert('alert-integrations', `✗ ${data.message}`, 'error');
             }
         } catch (err) {
-            showAlert('integrations', 'Test failed: ' + err.message, 'error');
+            showAlert('alert-integrations', 'Test failed: ' + err.message, 'error');
             console.error(err);
         }
     }
@@ -1611,20 +1755,20 @@
         if (!confirm(`Delete integration "${serviceName}"?`)) return;
         
         try {
-            const resp = await fetch(`/api/integrations/${serviceName}`, {
+            const resp = await fetch(`/api/integrations/${encodeURIComponent(serviceName)}`, {
                 method: 'DELETE'
             });
             
             const data = await resp.json();
             
             if (data.success) {
-                showAlert('integrations', data.message, 'success');
+                showAlert('alert-integrations', data.message, 'success');
                 await loadIntegrations();
             } else {
-                showAlert('integrations', data.message, 'error');
+                showAlert('alert-integrations', data.message, 'error');
             }
         } catch (err) {
-            showAlert('integrations', 'Failed to delete integration', 'error');
+            showAlert('alert-integrations', 'Failed to delete integration', 'error');
             console.error(err);
         }
     }
@@ -1636,6 +1780,7 @@
 
     function showPage(name, event) {
         currentPage = name;
+        sessionStorage.setItem('v2fun_current_page', name);
         document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
         const pageEl = document.getElementById('page-' + name);
@@ -1649,6 +1794,7 @@
         }
         
         if (name === 'gallery') loadGallery();
+        if (name === 'register') loadAccountList();
         if (name === 'manage') loadManagedAccounts();
         if (name === 'dashboard') loadDashboard();
         if (name === 'integrations') loadIntegrations();
@@ -1704,7 +1850,7 @@
                                 return `
                                     <tr>
                                         <td>${i+1}</td>
-                                        <td style="font-size:13px">${acc.email}</td>
+                                        <td style="font-size:13px">${escapeHtml(acc.email)}</td>
                                         <td>${statusBadge}</td>
                                         <td style="font-weight:600;color:#10b981">${acc.total_free}</td>
                                         <td style="font-weight:600;color:#ef4444">${acc.total_used}</td>
@@ -1733,7 +1879,7 @@
                         ${data.models.slice(0, 8).map(m => {
                             const total = m.total_free + m.total_used;
                             const usagePct = total > 0 ? (m.total_used / total * 100).toFixed(0) : 0;
-                            const modelName = m.model || m.name || 'Unknown';
+                            const modelName = escapeHtml(m.model || m.name || 'Unknown');
                             
                             return `
                                 <div style="background:var(--color-muted);padding:16px;border-radius:10px">
@@ -1761,7 +1907,7 @@
         }
     }
 
-    async function refreshDashboard() {
+    async function refreshDashboard(event) {
         const btn = event?.target?.closest('button');
         const originalText = btn?.innerHTML;
         
@@ -1866,8 +2012,8 @@
             for (const q of quotas) {
                 const pct = q.free_total > 0 ? (q.free_used / q.free_total) * 100 : 0;
                 const barColor = q.free_remaining > 0 ? 'var(--color-primary)' : 'var(--color-destructive)';
-                const model = q.model || '—';
-                const name = q.name || '—';
+                const model = escapeHtml(q.model || '—');
+                const name = escapeHtml(q.name || '—');
                 
                 html += `
                     <tr>

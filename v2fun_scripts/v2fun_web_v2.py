@@ -10,22 +10,40 @@ Usage:
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, send_from_directory, Response, send_file
 import json
 import os
-import sys
+import ipaddress
 import requests
+import socket
+import subprocess
+import sys
 import threading
-from pathlib import Path
+import time
+import uuid
+from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
 from werkzeug.utils import secure_filename
 import secrets
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+BASE_DIR = Path(__file__).resolve().parent.parent
+try:
+    from dotenv import load_dotenv
+    load_dotenv(BASE_DIR / ".env")
+except ImportError:
+    pass
+
+V2FUN_DATA_DIR = BASE_DIR / "v2fun_data"
+RESULTS_DIR = V2FUN_DATA_DIR / "results"
+ACCOUNT_FILE = BASE_DIR / "account.txt"
+
+# Add project root to path
+sys.path.insert(0, str(BASE_DIR))
 from v2fun_scripts.database import (
-    init_db, create_user, verify_user, get_user_by_id,
+    init_db, get_db, create_user, verify_user, get_user_by_id,
     update_user_token, create_generation, update_generation_status,
     get_user_generations, save_uploaded_image,
     create_session as create_db_session, verify_session as verify_db_session,
-    delete_session,
+    delete_session, cleanup_expired_sessions,
     import_v2fun_account, get_pending_accounts, get_all_v2fun_accounts,
     update_v2fun_account_status, delete_v2fun_account, get_v2fun_account_by_id,
     sync_v2fun_sessions_to_db, upsert_v2fun_account_from_session,
@@ -35,27 +53,65 @@ from v2fun_scripts.database import (
 from v2fun_scripts.sse_monitor import SSEMonitor
 from v2fun_scripts.token_manager import (
     get_token_status, get_time_remaining, is_token_valid,
-    check_and_refresh_if_needed, get_all_tokens_status
+    check_and_refresh_if_needed, get_all_tokens_status,
+    TokenRefreshScheduler, _sync_refreshed_token_to_db
+)
+from v2fun_scripts.v2fun_client import (
+    V2FunClient, find_account_password, parse_account_lines,
+    get_session_file_path, extract_token_from_session
 )
 
-# Active monitors: {user_id: SSEMonitor}
+# Active monitors: {generation_id: SSEMonitor}
 active_monitors: dict = {}
+monitors_lock = threading.Lock()
 # Pending events queue: {generation_id: [events]}
 pending_events: dict = {}
+
+
+def _get_or_create_secret_key() -> str:
+    """Get FLASK_SECRET_KEY from env or persist a generated key in v2fun_data/.flask_secret"""
+    env_key = os.environ.get('FLASK_SECRET_KEY')
+    if env_key:
+        return env_key
+    secret_file = V2FUN_DATA_DIR / '.flask_secret'
+    V2FUN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if secret_file.exists():
+        stored = secret_file.read_text(encoding='utf-8').strip()
+        if stored:
+            return stored
+    generated = secrets.token_hex(32)
+    secret_file.write_text(generated, encoding='utf-8')
+    return generated
+
 
 app = Flask(__name__, 
             template_folder='../v2fun_web_v2/templates',
             static_folder='../v2fun_web_v2/static')
-# Use a STATIC secret key so Gunicorn workers can share/decode the same session
-# cookies. A random key per-process (secrets.token_hex) breaks multi-worker setups
-# because each worker signs cookies with a different key.
-app.secret_key = os.environ.get('FLASK_SECRET_KEY', 'v2fun-stable-secret-key-change-in-production-2026')
-app.config['UPLOAD_FOLDER'] = Path('v2fun_data/uploads')
+app.secret_key = _get_or_create_secret_key()
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['UPLOAD_FOLDER'] = V2FUN_DATA_DIR / 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
 app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
 
-# Ensure upload folder exists
+# Ensure upload and results folders exist
 app.config['UPLOAD_FOLDER'].mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.before_request
+def _csrf_origin_check():
+    """Verify Origin/Referer on state-changing requests to mitigate CSRF."""
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return None
+    origin = request.headers.get("Origin")
+    referer = request.headers.get("Referer")
+    check_url = origin or referer
+    if check_url:
+        parsed = urlparse(check_url)
+        if parsed.netloc and parsed.netloc != request.host:
+            return jsonify({"success": False, "message": "Cross-origin request rejected"}), 403
+    return None
 
 
 def allowed_file(filename):
@@ -86,277 +142,32 @@ class V2FunAPIError(Exception):
         self.error_code = error_code
 
 
-class V2FunClient:
-    def __init__(self, token: str):
-        self.base_url = "https://api.prod.v2fun.ai"
-        self.token = token
-        self.headers = {
-            "Authorization": token,
-            "X-Access-Token": token,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Referer": "https://v2fun.ai/"
-        }
-    
-    def _handle_response(self, response, action="API call"):
-        """Centralized response handler with detailed error info"""
-        # Check for auth errors
-        if response.status_code == 401:
-            return {"success": False, "message": "Token expired or invalid. Please reconnect V2Fun account.", "error_code": "AUTH_EXPIRED"}
-        
-        if response.status_code == 403:
-            return {"success": False, "message": "Access forbidden. Account may be banned or restricted.", "error_code": "FORBIDDEN"}
-        
-        if response.status_code == 429:
-            return {"success": False, "message": "Rate limited. Too many requests. Please wait.", "error_code": "RATE_LIMITED"}
-        
-        if response.status_code >= 500:
-            return {"success": False, "message": f"V2Fun server error ({response.status_code}). Try again later.", "error_code": "SERVER_ERROR"}
-        
-        if response.status_code != 200:
-            # Try to get error message from response body
-            try:
-                error_data = response.json()
-                msg = error_data.get("message") or error_data.get("error") or str(error_data)
-                return {"success": False, "message": f"{action} failed: {msg}", "error_code": "API_ERROR"}
-            except:
-                return {"success": False, "message": f"{action} failed with status {response.status_code}", "error_code": "HTTP_ERROR"}
-        
-        # Success - parse JSON
-        try:
-            return response.json()
-        except ValueError:
-            return {"success": False, "message": f"Invalid JSON response from server", "error_code": "PARSE_ERROR"}
-    
-    def generate_image(self, prompt: str, **kwargs):
-        """Generate image with V2Fun API"""
-        if not prompt or not prompt.strip():
-            return {"success": False, "message": "Prompt cannot be empty", "error_code": "VALIDATION"}
-        
-        if len(prompt) > 5000:
-            return {"success": False, "message": "Prompt too long (max 5000 characters)", "error_code": "VALIDATION"}
-        
-        payload = {
-            "prompt": prompt.strip(),
-            "model": kwargs.get("model", "nano-banana-pro"),
-            "ratio": kwargs.get("ratio", "16:9"),
-            "num": kwargs.get("num", 1),
-            "quality": kwargs.get("quality", "medium")
-        }
-        
-        ref_imgs = kwargs.get("reference_images")
-        if ref_imgs:
-            if not isinstance(ref_imgs, list):
-                return {"success": False, "message": "reference_images must be an array", "error_code": "VALIDATION"}
-            if len(ref_imgs) > 3:
-                return {"success": False, "message": "Maximum 3 reference images allowed", "error_code": "VALIDATION"}
-            payload["referenceImages"] = ref_imgs
-        
-        try:
-            response = requests.post(
-                f"{self.base_url}/work/external/generate/image-generate?lan=en",
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-            return self._handle_response(response, "Image generation")
-        
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "Generation request timed out. V2Fun may be slow, try again.", "error_code": "TIMEOUT"}
-        except requests.exceptions.ConnectionError:
-            return {"success": False, "message": "Cannot connect to V2Fun server. Check internet connection.", "error_code": "CONNECTION"}
-        except requests.exceptions.RequestException as e:
-            return {"success": False, "message": f"Network error: {str(e)}", "error_code": "NETWORK"}
-    
-    def get_balance(self):
-        """Get user credit balance"""
-        try:
-            response = requests.get(
-                f"{self.base_url}/sys/user/get-balance?lan=en",
-                headers=self.headers,
-                timeout=10
-            )
-            return self._handle_response(response, "Get balance")
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "Balance check timed out", "error_code": "TIMEOUT"}
-        except requests.exceptions.RequestException as e:
-            return {"success": False, "message": f"Network error: {str(e)}", "error_code": "NETWORK"}
-    
-    def get_user_info(self):
-        """Get user login info"""
-        try:
-            response = requests.post(
-                f"{self.base_url}/sys/user/getLoginInfo?lan=en",
-                headers=self.headers,
-                timeout=10
-            )
-            return self._handle_response(response, "Get user info")
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "User info request timed out", "error_code": "TIMEOUT"}
-        except requests.exceptions.RequestException as e:
-            return {"success": False, "message": f"Network error: {str(e)}", "error_code": "NETWORK"}
-    
-    # All known configIds from V2Fun (captured from network analysis)
-    V2FUN_CONFIG_IDS = [
-        "2048727132348956673", "2027223916544393217", "1999059275770777602",
-        "1999058822540242946", "2072232369544179713", "2048727897058656258",
-        "2027224098833039361", "1999364117728792578", "1999345578888335362",
-        "2072232439534530561", "2005566311005237249", "2037420722827362306",
-        "2005578171616145409", "2005584046959439873", "2005584317174652929",
-        "2005586377985830913", "2005888354655268866", "2037418377902362625",
-        "2005887778982850561"
-    ]
-    
-    def get_free_count(self):
-        """Get free generation count per model from V2Fun"""
-        try:
-            response = requests.post(
-                f"{self.base_url}/work/get-free-cnt?lan=en",
-                headers=self.headers,
-                json={"configIds": self.V2FUN_CONFIG_IDS},
-                timeout=10
-            )
-            return self._handle_response(response, "Get free count")
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "Free count request timed out", "error_code": "TIMEOUT"}
-        except requests.exceptions.RequestException as e:
-            return {"success": False, "message": f"Network error: {str(e)}", "error_code": "NETWORK"}
-    
-    def get_business_config(self):
-        """Get business config to map configIds to model names"""
-        try:
-            response = requests.get(
-                f"{self.base_url}/work/config/business-config/list?lan=en",
-                headers=self.headers,
-                timeout=10
-            )
-            return self._handle_response(response, "Get business config")
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "Config request timed out", "error_code": "TIMEOUT"}
-        except requests.exceptions.RequestException as e:
-            return {"success": False, "message": f"Network error: {str(e)}", "error_code": "NETWORK"}
-    
-    def get_upload_credentials(self):
-        """Get Alibaba Cloud OSS STS credentials from V2Fun"""
-        try:
-            response = requests.post(
-                f"{self.base_url}/sys/oss/nologin/getAliSTS?lan=en",
-                headers={**self.headers, "Content-Type": "application/json"},
-                json={},
-                timeout=10
-            )
-            return self._handle_response(response, "Get upload credentials")
-        except requests.exceptions.Timeout:
-            return {"success": False, "message": "Upload credentials request timed out", "error_code": "TIMEOUT"}
-        except requests.exceptions.RequestException as e:
-            return {"success": False, "message": f"Network error: {str(e)}", "error_code": "NETWORK"}
-    
-    def upload_to_oss(self, file_path: str, mime_type: str = "image/jpeg", max_retries: int = 2):
-        """Upload file to Alibaba Cloud OSS with retry mechanism"""
-        
-        # Validate file
-        if not os.path.exists(file_path):
-            return {"success": False, "message": "File not found", "error_code": "FILE_NOT_FOUND"}
-        
-        file_size = os.path.getsize(file_path)
-        if file_size == 0:
-            return {"success": False, "message": "File is empty", "error_code": "FILE_EMPTY"}
-        
-        if file_size > 16 * 1024 * 1024:  # 16MB
-            return {"success": False, "message": "File too large (max 16MB)", "error_code": "FILE_TOO_LARGE"}
-        
-        last_error = None
-        
-        for attempt in range(max_retries + 1):
-            try:
-                # Step 1: Get STS credentials (retry each time)
-                sts_resp = self.get_upload_credentials()
-                if not sts_resp.get("success"):
-                    last_error = sts_resp.get("message", "Failed to get credentials")
-                    if attempt < max_retries:
-                        import time
-                        time.sleep(2)
-                        continue
-                    return {"success": False, "message": f"Upload credentials failed: {last_error}", "error_code": "STS_FAILED"}
-                
-                sts = sts_resp.get("result", {})
-                oss_host = sts.get("ossHost")
-                oss_path = sts.get("path")
-                
-                if not oss_host or not oss_path:
-                    return {"success": False, "message": "Invalid OSS credentials received", "error_code": "STS_INVALID"}
-                
-                # Step 2: Upload to OSS
-                with open(file_path, "rb") as f:
-                    files = {
-                        "file": (os.path.basename(file_path), f, mime_type)
-                    }
-                    form_data = {
-                        "OSSAccessKeyId": sts.get("accessKeyId"),
-                        "policy": sts.get("policy"),
-                        "Signature": sts.get("signature"),
-                        "key": oss_path,
-                        "x-oss-security-token": sts.get("securityToken"),
-                        "success_action_status": "200"
-                    }
-                    
-                    upload_resp = requests.post(
-                        oss_host,
-                        data=form_data,
-                        files=files,
-                        timeout=30
-                    )
-                    
-                    if upload_resp.status_code == 200:
-                        return {"success": True, "oss_path": oss_path}
-                    else:
-                        # Parse OSS error
-                        try:
-                            error_xml = upload_resp.text
-                            if "InvalidAccessKeyId" in error_xml:
-                                last_error = "OSS credentials expired"
-                            elif "AccessDenied" in error_xml:
-                                last_error = "OSS access denied"
-                            else:
-                                last_error = f"OSS error: {upload_resp.status_code}"
-                        except:
-                            last_error = f"OSS upload failed: {upload_resp.status_code}"
-                        
-                        if attempt < max_retries:
-                            import time
-                            time.sleep(2)
-                            continue
-                        
-                        return {"success": False, "message": last_error, "error_code": "OSS_UPLOAD_FAILED"}
-                
-            except requests.exceptions.Timeout:
-                last_error = "OSS upload timed out"
-                if attempt < max_retries:
-                    import time
-                    time.sleep(2)
-                    continue
-                return {"success": False, "message": last_error, "error_code": "TIMEOUT"}
-            
-            except requests.exceptions.ConnectionError:
-                last_error = "Cannot connect to OSS server"
-                if attempt < max_retries:
-                    import time
-                    time.sleep(2)
-                    continue
-                return {"success": False, "message": last_error, "error_code": "CONNECTION"}
-            
-            except IOError as e:
-                return {"success": False, "message": f"File read error: {str(e)}", "error_code": "FILE_READ_ERROR"}
-            
-            except Exception as e:
-                last_error = str(e)
-                if attempt < max_retries:
-                    import time
-                    time.sleep(2)
-                    continue
-                return {"success": False, "message": f"Upload error: {last_error}", "error_code": "UNKNOWN"}
-        
-        return {"success": False, "message": f"Upload failed after {max_retries + 1} attempts: {last_error}", "error_code": "RETRY_EXHAUSTED"}
+# Login rate limiter: {(ip, email): [failure_timestamps]}
+_login_failures: dict = defaultdict(list)
+_login_lock = threading.Lock()
+LOGIN_MAX_ATTEMPTS = 10
+LOGIN_WINDOW_SECONDS = 300
+
+
+def _is_login_rate_limited(client_ip: str, email: str) -> bool:
+    key = (client_ip or "unknown", (email or "").lower())
+    now = time.time()
+    with _login_lock:
+        recent = [ts for ts in _login_failures[key] if now - ts < LOGIN_WINDOW_SECONDS]
+        _login_failures[key] = recent
+        return len(recent) >= LOGIN_MAX_ATTEMPTS
+
+
+def _record_login_failure(client_ip: str, email: str):
+    key = (client_ip or "unknown", (email or "").lower())
+    with _login_lock:
+        _login_failures[key].append(time.time())
+
+
+def _clear_login_failures(client_ip: str, email: str):
+    key = (client_ip or "unknown", (email or "").lower())
+    with _login_lock:
+        _login_failures.pop(key, None)
 
 
 @app.route('/')
@@ -388,18 +199,23 @@ def api_register():
 
 @app.route('/api/login', methods=['POST'])
 def api_login():
-    """Login user"""
-    data = request.json
+    """Login user with brute-force rate limiting"""
+    data = request.json or {}
     email = data.get('email')
     password = data.get('password')
     
     if not email or not password:
         return jsonify({"success": False, "message": "Email and password required"})
     
+    client_ip = request.remote_addr
+    if _is_login_rate_limited(client_ip, email):
+        return jsonify({"success": False, "message": "Too many failed login attempts. Try again in 5 minutes."}), 429
+
     user = verify_user(email, password)
     
     if user:
-        # Create session
+        _clear_login_failures(client_ip, email)
+        cleanup_expired_sessions()
         session_token = create_db_session(user['id'])
         session['session_token'] = session_token
         
@@ -412,7 +228,8 @@ def api_login():
             }
         })
     else:
-        return jsonify({"success": False, "message": "Invalid email or password"})
+        _record_login_failure(client_ip, email)
+        return jsonify({"success": False, "message": "Invalid email or password"}), 401
 
 
 @app.route('/api/logout', methods=['POST'])
@@ -464,14 +281,14 @@ def api_connect_v2fun():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     v2fun_email = data.get('v2fun_email')
     
     if not v2fun_email:
         return jsonify({"success": False, "message": "V2Fun email required"})
     
     # Load token from saved session
-    v2fun_data_dir = Path("v2fun_data")
+    v2fun_data_dir = V2FUN_DATA_DIR
     email_safe = v2fun_email.replace("@", "_at_").replace(".", "_")
     session_file = v2fun_data_dir / f"v2fun_session_{email_safe}_latest.json"
     
@@ -504,6 +321,10 @@ def api_connect_v2fun():
     # on this account instead of jumping back to the first "done" account.
     session['selected_v2fun_email'] = v2fun_email
 
+    # Proactively refresh on activation if token is expired or < 12h remaining
+    user['v2fun_token'] = token
+    auto_refresh_if_needed(user, v2fun_email=v2fun_email)
+
     return jsonify({"success": True, "message": "V2Fun account connected successfully!"})
 
 
@@ -516,6 +337,8 @@ def api_upload_image():
     
     if not user.get('v2fun_token'):
         return jsonify({"success": False, "message": "Please select a V2Fun account first (dropdown top-right)"})
+
+    user = auto_refresh_if_needed(user)
     
     if 'file' not in request.files:
         return jsonify({"success": False, "message": "No file uploaded"})
@@ -553,8 +376,9 @@ def api_upload_image():
     file_size = os.path.getsize(file_path)
     
     # Save to local database
+    uid = user.get('user_id') or user.get('id')
     image_id = save_uploaded_image(
-        user['user_id'],
+        uid,
         filename,
         original_filename,
         str(file_path),
@@ -607,8 +431,10 @@ def api_generate():
     
     if not user.get('v2fun_token'):
         return jsonify({"success": False, "message": "Please select a V2Fun account first (dropdown top-right)"})
+
+    user = auto_refresh_if_needed(user)
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     if not data:
         return jsonify({"success": False, "message": "No data provided"})
     
@@ -649,8 +475,9 @@ def api_generate():
             return jsonify({"success": False, "message": "Generation submitted but no task UUID returned", "error_code": "NO_TASK_UUID"})
         
         try:
+            uid = user.get('user_id') or user.get('id')
             generation_id = create_generation(
-                user['user_id'],
+                uid,
                 prompt,
                 model=data.get("model"),
                 quality=data.get("quality"),
@@ -664,7 +491,7 @@ def api_generate():
             result["generation_id"] = generation_id
             
             # Start SSE monitor in background
-            start_monitor(user['user_id'], user['v2fun_token'], generation_id, task_uuid)
+            start_monitor(uid, user['v2fun_token'], generation_id, task_uuid)
         except Exception as e:
             return jsonify({"success": False, "message": f"Database error: {str(e)}", "error_code": "DB_ERROR"})
     
@@ -673,13 +500,47 @@ def api_generate():
 
 @app.route('/api/generations')
 def api_generations():
-    """Get user's generation history"""
+    """Get user's generation history with local_url resolved from v2fun_data/results"""
     user = get_current_user()
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
-    
-    generations = get_user_generations(user['user_id'], limit=20)
-    
+
+    from v2fun_scripts.image_downloader import download_image as dl_image, get_local_image_path
+
+    uid = user.get('user_id') or user.get('id')
+    generations = get_user_generations(uid, limit=50)
+
+    for g in generations:
+        local_path = g.get('local_path')
+        resolved_file = None
+
+        if local_path:
+            candidate = RESULTS_DIR / Path(local_path).name
+            if candidate.is_file():
+                resolved_file = candidate
+
+        if not resolved_file:
+            found_rel = get_local_image_path(g['id'])
+            if found_rel:
+                candidate = BASE_DIR / found_rel
+                if candidate.is_file():
+                    resolved_file = candidate
+                    local_path = found_rel
+                    update_generation_status(g['id'], g['status'], g.get('result_url'), g.get('thumbnail_url'), local_path=local_path)
+
+        # Backfill download to local folder if generation is done and result_url exists
+        if not resolved_file and g.get('status') == 'done' and g.get('result_url'):
+            dl_rel = dl_image(g['result_url'], g['id'], g.get('prompt', ''))
+            if dl_rel:
+                candidate = BASE_DIR / dl_rel
+                if candidate.is_file():
+                    resolved_file = candidate
+                    local_path = dl_rel
+                    update_generation_status(g['id'], 'done', g.get('result_url'), g.get('thumbnail_url'), local_path=local_path)
+
+        g['local_path'] = local_path
+        g['local_url'] = f"/results/{resolved_file.name}" if resolved_file else None
+
     return jsonify({
         "success": True,
         "generations": generations
@@ -689,15 +550,21 @@ def api_generations():
 @app.route('/api/sessions')
 def api_sessions():
     """Get available V2Fun sessions"""
-    v2fun_data = Path("v2fun_data")
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
+
+    v2fun_data = V2FUN_DATA_DIR
     session_files = list(v2fun_data.glob("v2fun_session_*_latest.json"))
     
     sessions = []
     for file in session_files:
-        with open(file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        tokens = data.get("tokens", {})
-        token = tokens.get("cookie_token") or tokens.get("localStorage_access_token")
+        try:
+            with open(file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        token = extract_token_from_session(data)
         if token:
             sessions.append({
                 "email": data.get("email"),
@@ -714,21 +581,9 @@ def api_import_accounts():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.json or {}
     accounts_text = data.get('accounts', '')
-    
-    accounts = []
-    for line in accounts_text.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        if '|' in line:
-            parts = line.split('|', 1)
-        elif ':' in line:
-            parts = line.split(':', 1)
-        else:
-            continue
-        accounts.append((parts[0].strip(), parts[1].strip()))
+    accounts = parse_account_lines(accounts_text)
     
     if not accounts:
         return jsonify({"success": False, "message": "No valid accounts found"})
@@ -779,7 +634,7 @@ def api_process_account():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     account_id = data.get('account_id')
     
     if not account_id:
@@ -792,7 +647,7 @@ def api_process_account():
     # Check if account already has valid token (skip re-login)
     from v2fun_scripts.token_manager import is_token_valid, get_token_expiry
     email_safe = account['email'].replace("@", "_at_").replace(".", "_")
-    session_file = Path("v2fun_data") / f"v2fun_session_{email_safe}_latest.json"
+    session_file = V2FUN_DATA_DIR / f"v2fun_session_{email_safe}_latest.json"
     
     if session_file.exists():
         with open(session_file, "r", encoding="utf-8") as f:
@@ -818,26 +673,19 @@ def api_process_account():
                 "skipped": True
             })
     
-    # No valid token - proceed with login
+    # No valid token - proceed with login using an isolated temporary account file
     update_v2fun_account_status(account_id, 'processing')
     
-    # Backup original account.txt and write only this account
-    account_file = Path("account.txt")
-    backup_file = Path("account.txt.bak")
+    temp_account_file = V2FUN_DATA_DIR / f"temp_account_{uuid.uuid4().hex}.txt"
+    login_script = BASE_DIR / "v2fun_scripts" / "v2fun_google_login.py"
     
     try:
-        # Backup original
-        if account_file.exists():
-            import shutil
-            shutil.copy2(str(account_file), str(backup_file))
+        V2FUN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temp_account_file.write_text(f"{account['email']}:{account['password']}", encoding="utf-8")
         
-        # Write only this account to account.txt
-        account_file.write_text(f"{account['email']}:{account['password']}", encoding="utf-8")
-        
-        import subprocess
         result = subprocess.run(
-            ["python", "v2fun_scripts/v2fun_google_login.py"],
-            capture_output=True, text=True, timeout=180
+            [sys.executable, str(login_script), "--account-file", str(temp_account_file)],
+            capture_output=True, text=True, timeout=180, cwd=str(BASE_DIR)
         )
         
         # Check if token was saved
@@ -881,11 +729,8 @@ def api_process_account():
         update_v2fun_account_status(account_id, 'failed', error_message=str(e))
         return jsonify({"success": False, "message": f"Error: {str(e)}"})
     finally:
-        # Restore original account.txt
-        if backup_file.exists():
-            import shutil
-            shutil.copy2(str(backup_file), str(account_file))
-            backup_file.unlink()
+        if temp_account_file.exists():
+            temp_account_file.unlink()
 
 
 @app.route('/api/process-all-accounts', methods=['POST'])
@@ -915,15 +760,49 @@ def api_delete_v2fun_account():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     account_id = data.get('account_id')
     
     if not account_id:
         return jsonify({"success": False, "message": "Account ID required"})
     
-    delete_v2fun_account(account_id)
+    uid = user.get('user_id') or user.get('id')
+    if not delete_v2fun_account(account_id, user_id=uid):
+        return jsonify({"success": False, "message": "Account not found or access denied"}), 403
     
     return jsonify({"success": True, "message": "Account deleted"})
+
+
+@app.route('/api/bulk-delete-v2fun-accounts', methods=['POST'])
+def api_bulk_delete_v2fun_accounts():
+    """Bulk delete V2Fun accounts from database (scoped to current user / unowned)"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    account_ids = data.get('account_ids') or []
+    if not isinstance(account_ids, list) or not account_ids:
+        return jsonify({"success": False, "message": "No account IDs selected"}), 400
+
+    uid = user.get('user_id') or user.get('id')
+    deleted = 0
+    skipped = 0
+    for aid in account_ids:
+        try:
+            if delete_v2fun_account(int(aid), user_id=uid):
+                deleted += 1
+            else:
+                skipped += 1
+        except (TypeError, ValueError):
+            skipped += 1
+
+    return jsonify({
+        "success": True,
+        "deleted": deleted,
+        "skipped": skipped,
+        "message": f"Deleted {deleted} account(s)" + (f" ({skipped} skipped)" if skipped else ""),
+    })
 
 
 @app.route('/api/quota-status')
@@ -1188,17 +1067,17 @@ def api_export_data():
     
     with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
         # Export database
-        db_path = Path("v2fun_data/v2fun.db")
+        db_path = V2FUN_DATA_DIR / "v2fun.db"
         if db_path.exists():
             zf.write(str(db_path), "v2fun.db")
         
         # Export session files (tokens)
-        v2fun_data = Path("v2fun_data")
+        v2fun_data = V2FUN_DATA_DIR
         for session_file in v2fun_data.glob("v2fun_session_*_latest.json"):
             zf.write(str(session_file), f"sessions/{session_file.name}")
         
         # Export account.txt
-        account_file = Path("account.txt")
+        account_file = ACCOUNT_FILE
         if account_file.exists():
             zf.write(str(account_file), "account.txt")
         
@@ -1269,21 +1148,26 @@ def api_import_data():
             if "export_meta.json" in zf.namelist():
                 meta = json.loads(zf.read("export_meta.json"))
             
-            # Import session files (tokens)
-            v2fun_data = Path("v2fun_data")
+            # Import session files (tokens) with Zip Slip protection
+            v2fun_data = V2FUN_DATA_DIR.resolve()
             v2fun_data.mkdir(parents=True, exist_ok=True)
             
             for name in zf.namelist():
                 if name.startswith("sessions/") and name.endswith(".json"):
-                    session_name = name.replace("sessions/", "")
-                    dest = v2fun_data / session_name
+                    rel_name = name[len("sessions/"):]
+                    # Reject nested paths or traversal attempts
+                    if not rel_name or "/" in rel_name or "\\" in rel_name or ".." in rel_name:
+                        continue
+                    dest = (v2fun_data / rel_name).resolve()
+                    if dest.parent != v2fun_data:
+                        continue
                     with open(dest, 'wb') as f:
                         f.write(zf.read(name))
                     results["sessions"] += 1
             
             # Import account.txt
             if "account.txt" in zf.namelist():
-                with open("account.txt", 'wb') as f:
+                with open(ACCOUNT_FILE, 'wb') as f:
                     f.write(zf.read("account.txt"))
                 results["account_txt"] = True
             
@@ -1315,16 +1199,19 @@ def api_import_data():
                 conn.commit()
                 conn.close()
             
-            # Import database (overwrite - careful!)
+            # Import database (overwrite - validate SQLite header first!)
             if "v2fun.db" in zf.namelist() and request.form.get('import_db') == 'true':
-                db_path = Path("v2fun_data/v2fun.db")
+                db_bytes = zf.read("v2fun.db")
+                if not db_bytes.startswith(b"SQLite format 3\x00"):
+                    return jsonify({"success": False, "message": "Invalid SQLite database file in backup"}), 400
+                db_path = V2FUN_DATA_DIR / "v2fun.db"
                 # Backup current DB first
                 if db_path.exists():
                     backup_path = db_path.parent / f"v2fun.db.backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     shutil.copy2(str(db_path), str(backup_path))
                 
                 with open(db_path, 'wb') as f:
-                    f.write(zf.read("v2fun.db"))
+                    f.write(db_bytes)
                 results["db"] = True
         
         return jsonify({
@@ -1345,15 +1232,21 @@ def api_import_data():
 @app.route('/api/manage-accounts')
 def api_manage_accounts():
     """List all V2Fun sessions for management"""
-    v2fun_data = Path("v2fun_data")
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
+
+    v2fun_data = V2FUN_DATA_DIR
     session_files = list(v2fun_data.glob("v2fun_session_*_latest.json"))
     
     accounts = []
     for file in session_files:
-        with open(file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        tokens = data.get("tokens", {})
-        token = tokens.get("cookie_token") or tokens.get("localStorage_access_token")
+        try:
+            with open(file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        token = extract_token_from_session(data)
         accounts.append({
             "email": data.get("email"),
             "timestamp": data.get("timestamp"),
@@ -1371,13 +1264,13 @@ def api_delete_account():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
         return jsonify({"success": False, "message": "Email required"})
     
-    v2fun_data = Path("v2fun_data")
+    v2fun_data = V2FUN_DATA_DIR
     email_safe = email.replace("@", "_at_").replace(".", "_")
     
     # Delete all session files for this email
@@ -1393,6 +1286,38 @@ def api_delete_account():
         return jsonify({"success": False, "message": "Account not found"})
 
 
+@app.route('/api/bulk-delete-accounts', methods=['POST'])
+def api_bulk_delete_accounts():
+    """Bulk delete V2Fun session files for selected emails"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
+
+    data = request.get_json(silent=True) or {}
+    emails = data.get('emails') or []
+    if not isinstance(emails, list) or not emails:
+        return jsonify({"success": False, "message": "No accounts selected"}), 400
+
+    deleted = 0
+    for email in emails:
+        if not isinstance(email, str) or not email.strip():
+            continue
+        email_safe = email.strip().replace("@", "_at_").replace(".", "_")
+        removed_any = False
+        for pattern in [f"v2fun_session_{email_safe}_latest.json", f"v2fun_tokens_{email_safe}_*.json"]:
+            for f in V2FUN_DATA_DIR.glob(pattern):
+                f.unlink()
+                removed_any = True
+        if removed_any:
+            deleted += 1
+
+    return jsonify({
+        "success": True,
+        "deleted": deleted,
+        "message": f"Deleted {deleted} session(s) successfully",
+    })
+
+
 @app.route('/api/retry-account', methods=['POST'])
 def api_retry_account():
     """Retry login for a specific V2Fun account"""
@@ -1400,7 +1325,7 @@ def api_retry_account():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
@@ -1422,45 +1347,26 @@ def api_retry_account():
     
     # Fallback: check account.txt
     if not password:
-        account_file = Path("account.txt")
-        if account_file.exists():
-            with open(account_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith('#') or not line:
-                        continue
-                    if '|' in line:
-                        parts = line.split('|', 1)
-                    elif ':' in line:
-                        parts = line.split(':', 1)
-                    else:
-                        continue
-                    if parts[0].strip() == email:
-                        password = parts[1].strip()
-                        break
+        password = find_account_password(email, ACCOUNT_FILE)
     
     if not password:
         return jsonify({"success": False, "message": "Password not found for this email"})
     
-    # Backup account.txt and write only this account
-    account_file = Path("account.txt")
-    backup_file = Path("account.txt.bak")
+    # Run login in isolated temporary account file (never overwrite account.txt)
+    temp_account_file = V2FUN_DATA_DIR / f"temp_account_{uuid.uuid4().hex}.txt"
+    login_script = BASE_DIR / "v2fun_scripts" / "v2fun_google_login.py"
     
     try:
-        import shutil
-        if account_file.exists():
-            shutil.copy2(str(account_file), str(backup_file))
+        V2FUN_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        temp_account_file.write_text(f"{email}:{password}", encoding="utf-8")
         
-        account_file.write_text(f"{email}:{password}", encoding="utf-8")
-        
-        import subprocess
         result = subprocess.run(
-            ["python", "v2fun_scripts/v2fun_google_login.py"],
-            capture_output=True, text=True, timeout=180
+            [sys.executable, str(login_script), "--account-file", str(temp_account_file)],
+            capture_output=True, text=True, timeout=180, cwd=str(BASE_DIR)
         )
         
         email_safe = email.replace("@", "_at_").replace(".", "_")
-        session_file = Path("v2fun_data") / f"v2fun_session_{email_safe}_latest.json"
+        session_file = V2FUN_DATA_DIR / f"v2fun_session_{email_safe}_latest.json"
         
         if session_file.exists():
             return jsonify({"success": True, "message": f"Retry successful for {email}"})
@@ -1474,11 +1380,8 @@ def api_retry_account():
     except Exception as e:
         return jsonify({"success": False, "message": f"Error: {str(e)}"})
     finally:
-        # Restore original account.txt
-        import shutil
-        if backup_file.exists():
-            shutil.copy2(str(backup_file), str(account_file))
-            backup_file.unlink()
+        if temp_account_file.exists():
+            temp_account_file.unlink()
 
 
 @app.route('/api/token-status')
@@ -1499,36 +1402,20 @@ def api_refresh_token():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     email = data.get('email')
     
     if not email:
         return jsonify({"success": False, "message": "Email required"})
     
     # Find password from account.txt
-    password = None
-    account_file = Path("account.txt")
-    if account_file.exists():
-        with open(account_file, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('#') or not line:
-                    continue
-                if '|' in line:
-                    parts = line.split('|', 1)
-                elif ':' in line:
-                    parts = line.split(':', 1)
-                else:
-                    continue
-                if parts[0].strip() == email:
-                    password = parts[1].strip()
-                    break
+    password = find_account_password(email, ACCOUNT_FILE)
     
     if not password:
         return jsonify({"success": False, "message": "Password not found in account.txt"})
     
     # Get current token
-    v2fun_data = Path("v2fun_data")
+    v2fun_data = V2FUN_DATA_DIR
     email_safe = email.replace("@", "_at_").replace(".", "_")
     session_file = v2fun_data / f"v2fun_session_{email_safe}_latest.json"
     
@@ -1536,9 +1423,9 @@ def api_refresh_token():
         return jsonify({"success": False, "message": "Session file not found"})
     
     with open(session_file, "r", encoding="utf-8") as f:
-        session = json.load(f)
+        sess_data = json.load(f)
     
-    old_token = session.get("tokens", {}).get("cookie_token", "")
+    old_token = sess_data.get("tokens", {}).get("cookie_token", "")
     status = get_token_status(old_token)
     
     # Refresh token
@@ -1546,15 +1433,16 @@ def api_refresh_token():
     
     if new_token:
         # Update session file
-        session["tokens"]["cookie_token"] = new_token
-        session["timestamp"] = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sess_data["tokens"]["cookie_token"] = new_token
+        sess_data["timestamp"] = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         with open(session_file, "w", encoding="utf-8") as f:
-            json.dump(session, f, indent=2, ensure_ascii=False)
+            json.dump(sess_data, f, indent=2, ensure_ascii=False)
         
         # If this is the connected account, update DB
-        if user.get('v2fun_token') == old_token:
-            update_user_token(user['user_id'], new_token)
+        uid = user.get('user_id') or user.get('id')
+        if user.get('v2fun_token') == old_token and uid:
+            update_user_token(uid, new_token)
         
         remaining = get_time_remaining(new_token)
         return jsonify({
@@ -1619,7 +1507,7 @@ def api_save_integration():
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     service_name = data.get('service_name', '').strip()
     base_url = data.get('base_url', '').strip()
     api_key = data.get('api_key', '').strip()
@@ -1657,7 +1545,7 @@ def api_toggle_integration(service_name):
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
     
-    data = request.json
+    data = request.get_json(silent=True) or {}
     is_active = data.get('is_active', True)
     
     user_id = user.get('user_id') or user.get('id')
@@ -1665,6 +1553,24 @@ def api_toggle_integration(service_name):
     
     status = "enabled" if is_active else "disabled"
     return jsonify({"success": True, "message": f"{service_name} integration {status}"})
+
+
+def _is_safe_external_url(url: str) -> bool:
+    """Reject non-HTTP(S) and internal/private/loopback/link-local targets to mitigate SSRF"""
+    if os.environ.get('ALLOW_PRIVATE_INTEGRATIONS', 'false').lower() == 'true':
+        return url.startswith(('http://', 'https://'))
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ('http', 'https') or not parsed.hostname:
+            return False
+        infos = socket.getaddrinfo(parsed.hostname, None)
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved:
+                return False
+        return True
+    except Exception:
+        return False
 
 
 @app.route('/api/integrations/<service_name>/test', methods=['POST'])
@@ -1680,12 +1586,16 @@ def api_test_integration(service_name):
     if not integration:
         return jsonify({"success": False, "message": "Integration not found"}), 404
     
+    if not _is_safe_external_url(integration['base_url']):
+        return jsonify({"success": False, "message": "Integration URL points to a disallowed or private address"}), 400
+
     try:
         # Test health endpoint
         response = requests.get(
             f"{integration['base_url'].rstrip('/')}/health",
             headers={'Authorization': f"Bearer {integration['api_key']}"},
-            timeout=10
+            timeout=10,
+            allow_redirects=False
         )
         
         if response.status_code == 200:
@@ -1706,43 +1616,67 @@ def api_test_integration(service_name):
         })
 
 
-def auto_refresh_if_needed(user_data: dict) -> dict:
-    """Auto-check and refresh token before API calls (middleware)"""
+@app.route('/api/refresh-all-tokens', methods=['POST'])
+def api_refresh_all_tokens():
+    """Proactively refresh all expiring V2Fun tokens on demand"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
+
+    from v2fun_scripts.token_manager import refresh_all_expiring_tokens
+    data = request.json or {}
+    force = bool(data.get('force', False))
+    summary = refresh_all_expiring_tokens(force=force)
+    return jsonify({"success": True, "summary": summary})
+
+
+def auto_refresh_if_needed(user_data: dict, v2fun_email: str = None) -> dict:
+    """Auto-check and refresh token before API calls / on activation"""
     token = user_data.get('v2fun_token')
     if not token:
         return user_data
-    
+
     status = get_token_status(token)
-    
-    # Only auto-refresh if expired or critical
     if status in ("expired", "critical"):
-        email = user_data.get('email') or user_data.get('google_email')
+        email = v2fun_email or session.get('selected_v2fun_email') or user_data.get('google_email')
+        if not email:
+            # Look up matching V2Fun account email in DB by current token
+            conn = get_db()
+            try:
+                row = conn.execute(
+                    "SELECT email, password FROM v2fun_accounts WHERE jwt_token = ?",
+                    (token,),
+                ).fetchone()
+            finally:
+                conn.close()
+            if row:
+                email = row['email']
+
         if email:
-            # Find password
             password = None
-            account_file = Path("account.txt")
-            if account_file.exists():
-                with open(account_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line.startswith('#') or not line:
-                            continue
-                        if '|' in line:
-                            parts = line.split('|', 1)
-                        elif ':' in line:
-                            parts = line.split(':', 1)
-                        else:
-                            continue
-                        if parts[0].strip() == email:
-                            password = parts[1].strip()
-                            break
-            
+            conn = get_db()
+            try:
+                row = conn.execute(
+                    "SELECT password FROM v2fun_accounts WHERE email = ?",
+                    (email,),
+                ).fetchone()
+                if row and row['password']:
+                    password = row['password']
+            finally:
+                conn.close()
+
+            if not password:
+                password = find_account_password(email, ACCOUNT_FILE)
+
             if password:
-                new_status, new_token = check_and_refresh_if_needed(token, email, password)
+                _, new_token = check_and_refresh_if_needed(token, email, password)
                 if new_token:
+                    _sync_refreshed_token_to_db(email, token, new_token)
                     user_data['v2fun_token'] = new_token
-                    update_user_token(user_data['user_id'], new_token)
-    
+                    uid = user_data.get('user_id') or user_data.get('id')
+                    if uid:
+                        update_user_token(uid, new_token)
+
     return user_data
 
 
@@ -1754,6 +1688,12 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
         if generation_id not in pending_events:
             pending_events[generation_id] = []
         pending_events[generation_id].append(ev)
+
+    def _clear_monitor():
+        with monitors_lock:
+            mon = active_monitors.pop(generation_id, None)
+        if mon:
+            mon.stop()
 
     def on_update(tid, event):
         push_event({
@@ -1767,6 +1707,8 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
     def on_done(tid, event):
         status = event.get("status", "")
         work_url = event.get("work_url") or event.get("thumb")
+        if work_url and not work_url.startswith("http"):
+            work_url = f"https://asset.v2fun.ai/{work_url}"
         db_status = "done" if status in ("C", "COMPLETED", "DONE", "SUCCESS") else "failed"
         
         # Download image to local storage
@@ -1784,23 +1726,26 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
         
         # Update database with result URL and local path
         update_generation_status(generation_id, db_status, work_url, work_url, local_path=local_path)
+        local_url = f"/results/{Path(local_path).name}" if local_path else None
         
         push_event({
             "type": "done", 
             "status": db_status, 
             "work_url": work_url, 
-            "local_path": local_path
+            "local_path": local_path,
+            "local_url": local_url
         })
-        active_monitors.pop(user_id, None)
+        _clear_monitor()
 
     def on_error(tid, error):
         update_generation_status(generation_id, "failed", error_message=error)
         push_event({"type": "error", "message": error})
-        active_monitors.pop(user_id, None)
+        _clear_monitor()
 
-    # Start SSE monitor
+    # Start SSE monitor keyed by generation_id so concurrent tasks don't clobber each other
     monitor = SSEMonitor(token)
-    active_monitors[user_id] = monitor
+    with monitors_lock:
+        active_monitors[generation_id] = monitor
     t = threading.Thread(target=lambda: monitor.watch(task_uuid, on_update=on_update, on_done=on_done, on_error=on_error), daemon=True)
     t.start()
 
@@ -1833,7 +1778,9 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
         
         max_attempts = 60  # 10 minutes max (polling every 10s)
         for attempt in range(max_attempts):
-            if user_id not in active_monitors:
+            with monitors_lock:
+                still_active = generation_id in active_monitors
+            if not still_active:
                 return  # Monitor already finished via SSE
             
             try:
@@ -1882,15 +1829,17 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
                                                 conn.close()
                                                 prompt = row['prompt'] if row else ""
                                                 local_path = dl_image(full_url, generation_id, prompt)
+                                                local_url = f"/results/{Path(local_path).name}" if local_path else None
                                                 
                                                 update_generation_status(generation_id, "done", full_url, thumb if thumb else full_url, local_path=local_path)
                                                 push_event({
                                                     "type": "done",
                                                     "status": "done",
                                                     "work_url": full_url,
-                                                    "local_path": local_path
+                                                    "local_path": local_path,
+                                                    "local_url": local_url
                                                 })
-                                                active_monitors.pop(user_id, None)
+                                                _clear_monitor()
                                                 return
                                             
                                             elif gen_status == "I":
@@ -1902,7 +1851,7 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
                                                     "status": "processing"
                                                 })
                                             
-                                            elif gen_status == "F":
+                                            elif gen_status in ("F", "E"):
                                                 # Failed
                                                 update_generation_status(generation_id, "failed", error_message="Generation failed on server")
                                                 push_event({
@@ -1910,7 +1859,7 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
                                                     "status": "failed",
                                                     "work_url": None
                                                 })
-                                                active_monitors.pop(user_id, None)
+                                                _clear_monitor()
                                                 return
             except Exception as e:
                 print(f"Polling error: {e}")
@@ -1923,7 +1872,7 @@ def start_monitor(user_id: int, token: str, generation_id: int, task_uuid: str):
             "status": "timeout",
             "work_url": None
         })
-        active_monitors.pop(user_id, None)
+        _clear_monitor()
 
     t2 = threading.Thread(target=polling_fallback, daemon=True)
     t2.start()
@@ -1936,19 +1885,31 @@ def api_generation_stream(generation_id):
     if not user:
         return jsonify({"success": False, "message": "Not authenticated"}), 401
 
+    uid = user.get('user_id') or user.get('id')
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT user_id FROM generations WHERE id = ?", (generation_id,)).fetchone()
+    finally:
+        conn.close()
+    if not row or row['user_id'] != uid:
+        return jsonify({"success": False, "message": "Generation not found"}), 404
+
     def event_stream():
         import time
         timeout = 300
         elapsed = 0
-        while elapsed < timeout:
-            events = pending_events.pop(generation_id, [])
-            for ev in events:
-                yield f"data: {json.dumps(ev)}\n\n"
-                if ev.get("type") in ("done", "error"):
-                    return
-            time.sleep(1)
-            elapsed += 1
-        yield f"data: {json.dumps({'type': 'timeout'})}\n\n"
+        try:
+            while elapsed < timeout:
+                events = pending_events.pop(generation_id, [])
+                for ev in events:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                    if ev.get("type") in ("done", "error"):
+                        return
+                time.sleep(1)
+                elapsed += 1
+            yield f"data: {json.dumps({'type': 'timeout'})}\n\n"
+        finally:
+            pending_events.pop(generation_id, None)
 
     return Response(event_stream(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1956,14 +1917,18 @@ def api_generation_stream(generation_id):
 
 @app.route('/uploads/<filename>')
 def uploaded_file(filename):
-    """Serve uploaded reference images"""
+    """Serve uploaded reference images (authenticated)"""
+    if not get_current_user():
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
 
 @app.route('/results/<filename>')
 def result_file(filename):
-    """Serve downloaded result images"""
-    return send_from_directory(Path("v2fun_data/results"), filename)
+    """Serve downloaded result images (authenticated)"""
+    if not get_current_user():
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
+    return send_from_directory(RESULTS_DIR, filename)
 
 
 if __name__ == '__main__':
@@ -1989,4 +1954,15 @@ if __name__ == '__main__':
     print("Open browser: http://localhost:5000")
     print("\nPress Ctrl+C to stop\n")
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    if os.environ.get('ENABLE_TOKEN_AUTO_REFRESH', 'true').lower() == 'true':
+        scheduler = TokenRefreshScheduler(
+            interval_hours=float(os.environ.get('TOKEN_REFRESH_INTERVAL_HOURS', '1')),
+            min_remaining_hours=float(os.environ.get('TOKEN_REFRESH_BEFORE_HOURS', '12')),
+            force=os.environ.get('TOKEN_REFRESH_FORCE', 'true').lower() == 'true',
+        )
+        scheduler.start()
+
+    debug_mode = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+    host = os.environ.get('FLASK_HOST', '0.0.0.0')
+    port = int(os.environ.get('FLASK_PORT', '5000'))
+    app.run(host=host, port=port, debug=debug_mode)

@@ -8,6 +8,7 @@ email2@gmail.com|password2
 email3@gmail.com|password3
 """
 
+import argparse
 import asyncio
 import json
 import os
@@ -98,8 +99,14 @@ class V2FunGoogleLogin:
             return False
     
     async def handle_google_login_popup(self, popup: Page, main_page: Page):
-        """Handle Google OAuth login flow in popup window"""
+        """Handle Google OAuth login flow in popup window or same page"""
         self.print_step("Starting Google OAuth login...", "progress")
+        
+        is_same_page = (popup == main_page)
+        if is_same_page:
+            self.print_step("OAuth in same page mode", "info")
+        else:
+            self.print_step("OAuth in popup mode", "info")
         
         # Prevent popup from closing prematurely by listening to beforeunload
         try:
@@ -112,8 +119,11 @@ class V2FunGoogleLogin:
         try:
             await popup.wait_for_load_state("domcontentloaded")
             await asyncio.sleep(2)
-            await popup.wait_for_load_state("networkidle", timeout=10000)
-            self.print_step("Google OAuth popup loaded", "success")
+            try:
+                await popup.wait_for_load_state("networkidle", timeout=10000)
+            except:
+                self.print_step("Network idle timeout, continuing anyway...", "warning")
+            self.print_step("Google OAuth page loaded", "success")
             
             # Check if we're on Google accounts page
             current_url = popup.url
@@ -383,41 +393,65 @@ class V2FunGoogleLogin:
             
             # Wait for redirect back to V2Fun (check URL change)
             self.print_step("Waiting for OAuth completion...", "progress")
+            oauth_completed = False
             try:
                 # Wait for URL to change to v2fun.ai (indicates successful OAuth)
                 max_wait = 30  # 30 seconds max
                 for i in range(max_wait):
-                    current_url = popup.url
-                    if "v2fun.ai" in current_url or popup.is_closed():
-                        self.print_step("OAuth redirect detected", "success")
-                        break
+                    try:
+                        current_url = popup.url
+                        if "v2fun.ai" in current_url:
+                            self.print_step("OAuth redirect to V2Fun detected", "success")
+                            oauth_completed = True
+                            break
+                        if popup.is_closed():
+                            self.print_step("Popup closed by user or redirect", "info")
+                            oauth_completed = True
+                            break
+                    except:
+                        # Popup might be closed
+                        if popup.is_closed():
+                            self.print_step("Popup closed", "info")
+                            oauth_completed = True
+                            break
                     await asyncio.sleep(1)
+                
+                if not oauth_completed:
+                    self.print_step("OAuth did not complete within timeout", "warning")
+                    # Take screenshot for debugging
+                    try:
+                        screenshot_path = f"v2fun_data/debug_oauth_timeout_{self.email.replace('@', '_at_').replace('.', '_')}.png"
+                        await popup.screenshot(path=screenshot_path)
+                        self.print_step(f"Debug screenshot saved: {screenshot_path}", "info")
+                    except:
+                        pass
+                    return False
                 
                 # Wait a bit more to ensure token is set
                 if not popup.is_closed():
                     await asyncio.sleep(3)
                     self.print_step("Waiting for token synchronization...", "progress")
                 
-                # Now wait for popup to close naturally or close it
-                try:
-                    await popup.wait_for_event("close", timeout=10000)
-                    self.print_step("OAuth popup closed naturally", "success")
-                except:
-                    self.print_step("Popup still open, closing manually...", "info")
+                # Now close popup only if OAuth completed and it's a separate popup
+                if oauth_completed and not is_same_page:
                     try:
                         if not popup.is_closed():
-                            await popup.close()
-                            self.print_step("Popup closed manually", "success")
-                    except Exception as e:
-                        self.print_step(f"Popup already closed: {str(e)[:50]}", "info")
+                            await popup.wait_for_event("close", timeout=5000)
+                            self.print_step("OAuth popup closed naturally", "success")
+                    except:
+                        # Manually close if still open
+                        try:
+                            if not popup.is_closed():
+                                await popup.close()
+                                self.print_step("Popup closed manually", "success")
+                        except Exception as e:
+                            self.print_step(f"Popup already closed: {str(e)[:50]}", "info")
+                elif is_same_page:
+                    self.print_step("Same-page OAuth completed, keeping page open", "info")
+                    
             except Exception as e:
-                self.print_step(f"OAuth completion check: {str(e)[:80]}", "warning")
-                # Try to close popup if still open
-                try:
-                    if not popup.is_closed():
-                        await popup.close()
-                except:
-                    pass
+                self.print_step(f"OAuth completion check error: {str(e)[:80]}", "error")
+                return False
             
             # Wait for main page to update after OAuth
             await asyncio.sleep(5)
@@ -688,7 +722,8 @@ class V2FunGoogleLogin:
         self.print_step("Saving session data...", "progress")
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = "v2fun_data"
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        output_dir = os.path.join(base_dir, "v2fun_data")
         os.makedirs(output_dir, exist_ok=True)
         
         # Sanitize email for filename
@@ -740,9 +775,20 @@ class V2FunGoogleLogin:
                 'a:has-text("Login")',
                 '[href*="login"]'
             ]
+            login_clicked = False
             for selector in login_selectors:
                 if await self.wait_and_click(page, selector, timeout=5000, description="Login button"):
+                    login_clicked = True
                     break
+            
+            if not login_clicked:
+                self.print_step("Login button not found", "error")
+                await context.close()
+                return False
+            
+            # Wait for login modal/page to appear
+            await asyncio.sleep(3)
+            self.print_step("Login modal loaded", "success")
             
             # Click "Continue with Google" button and wait for popup
             self.print_step("Looking for Google OAuth button...", "progress")
@@ -750,32 +796,107 @@ class V2FunGoogleLogin:
                 'button:has-text("Continue with Google")',
                 'button:has-text("Google")',
                 '[aria-label*="Google"]',
-                'button[class*="google"]'
+                'button[class*="google"]',
+                'div[class*="google"]'
             ]
             
-            # Find the button first
+            # Find the button first - wait longer for it to appear
             button_selector = None
-            for selector in google_selectors:
-                try:
-                    if await page.locator(selector).count() > 0:
-                        button_selector = selector
-                        break
-                except:
-                    continue
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                for selector in google_selectors:
+                    try:
+                        count = await page.locator(selector).count()
+                        if count > 0:
+                            button_selector = selector
+                            self.print_step(f"Found Google button: {selector}", "success")
+                            break
+                    except:
+                        continue
+                
+                if button_selector:
+                    break
+                
+                # Wait and retry
+                if attempt < max_attempts - 1:
+                    self.print_step(f"Google button not found yet, waiting... (attempt {attempt + 1}/{max_attempts})", "warning")
+                    await asyncio.sleep(2)
             
             if not button_selector:
                 self.print_step("Google OAuth button not found", "error")
                 await context.close()
                 return False
             
-            # Click button and wait for popup simultaneously
+            # Click button and wait for popup - with fallback for same-page navigation
             self.print_step("Clicking Google OAuth button...", "progress")
-            async with context.expect_page(timeout=30000) as popup_info:
-                await page.click(button_selector)
-                self.print_step("Clicked: Continue with Google", "success")
             
-            # Handle Google OAuth in popup
-            if not await self.handle_google_login_popup(await popup_info.value, page):
+            # Try to detect popup, but with fallback to same page
+            popup = None
+            try:
+                # Wait for popup with enough time for Google OAuth to open
+                async with context.expect_page(timeout=20000) as popup_info:
+                    await page.click(button_selector)
+                    self.print_step("Clicked: Continue with Google", "success")
+                popup = await popup_info.value
+                self.print_step("Popup window detected", "success")
+            except Exception as e:
+                self.print_step(f"No popup detected: {str(e)[:50]}", "warning")
+                self.print_step("Checking if OAuth opened in same page...", "progress")
+                
+                # Wait for navigation in the same page
+                await asyncio.sleep(3)
+                current_url = page.url
+                
+                if "accounts.google.com" in current_url or "google.com/o/oauth2" in current_url:
+                    self.print_step("OAuth opened in same page (not popup)", "info")
+                    popup = page  # Use the same page as "popup"
+                else:
+                    # Try clicking again with JavaScript as fallback
+                    self.print_step("Retrying with JavaScript click...", "progress")
+                    try:
+                        # Use Playwright locator evaluation because selectors like :has-text are not valid CSS
+                        locator = page.locator(button_selector).first()
+                        if await locator.count() > 0:
+                            await locator.evaluate("element => element.click()")
+                            clicked = True
+                        else:
+                            clicked = False
+                        
+                        if clicked:
+                            self.print_step("JS click successful", "success")
+                        else:
+                            self.print_step("JS click failed - button not found", "warning")
+                        
+                        await asyncio.sleep(3)
+                        
+                        current_url = page.url
+                        if "accounts.google.com" in current_url or "google.com/o/oauth2" in current_url:
+                            self.print_step("OAuth opened after JS click", "success")
+                            popup = page
+                        else:
+                            self.print_step("OAuth still not opening, trying new page wait...", "warning")
+                            # Last attempt: wait for new page with enough time
+                            try:
+                                async with context.expect_page(timeout=20000) as popup_info:
+                                    await page.click(button_selector, force=True)
+                                popup = await popup_info.value
+                                self.print_step("Popup finally detected", "success")
+                            except:
+                                self.print_step("Could not detect OAuth page", "error")
+                                await context.close()
+                                return False
+                    except Exception as js_error:
+                        self.print_step(f"JS click failed: {str(js_error)[:50]}", "error")
+                        await context.close()
+                        return False
+            
+            if not popup:
+                self.print_step("OAuth page not detected", "error")
+                await context.close()
+                return False
+            
+            # Handle Google OAuth in popup or same page
+            if not await self.handle_google_login_popup(popup, page):
                 self.print_step("Login failed - skipping this account", "error")
                 await context.close()
                 return False
@@ -809,8 +930,9 @@ class V2FunGoogleLogin:
 
 def has_valid_token(email: str) -> bool:
     """Check if account already has a valid (non-expired) token"""
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     email_safe = email.replace("@", "_at_").replace(".", "_")
-    session_file = os.path.join("v2fun_data", f"v2fun_session_{email_safe}_latest.json")
+    session_file = os.path.join(base_dir, "v2fun_data", f"v2fun_session_{email_safe}_latest.json")
     
     if not os.path.exists(session_file):
         return False
@@ -885,8 +1007,36 @@ def load_accounts(filepath: str = "account.txt"):
     return accounts
 
 
+async def process_account_with_worker(browser, accounts, results, worker_id, semaphore, force: bool = False):
+    async with semaphore:
+        while accounts:
+            try:
+                idx, email, password = accounts.pop(0)
+            except IndexError:
+                break
+
+            console.print(f"\n[dim]Worker {worker_id} processing account {idx}: {email}[/dim]")
+            if not force and has_valid_token(email):
+                console.print(f"\n[green][+] Account {idx}: {email} already has valid token. Skipping.[/green]")
+                results.append((idx, email, True))
+                continue
+
+            login = V2FunGoogleLogin(email, password, idx, len(accounts) + len(results))
+            success = await login.run(browser)
+            results.append((idx, email, success))
+            await asyncio.sleep(5)
+
+
 async def main():
     """Entry point"""
+    parser = argparse.ArgumentParser(description="V2Fun.ai Multi-Account Google Login")
+    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers (1-3 recommended)")
+    parser.add_argument("--account-file", default="account.txt", help="Path to account file")
+    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+    parser.add_argument("--force", action="store_true", help="Force re-login even if existing token is valid")
+    args = parser.parse_args()
+    workers = max(1, min(args.workers, 4))
+
     console.print(Panel.fit(
         "[bold cyan]V2Fun.ai Multi-Account Google Login Automation[/bold cyan]\n"
         "[dim]Automated login, survey completion, and token extraction[/dim]",
@@ -895,14 +1045,15 @@ async def main():
     ))
     
     # Load accounts
-    console.print("\n[bold]Loading accounts from account.txt...[/bold]")
-    accounts = load_accounts("account.txt")
+    console.print(f"\n[bold]Loading accounts from {args.account_file}...[/bold]")
+    accounts = load_accounts(args.account_file)
     
     if not accounts:
         console.print("[red]No valid accounts found. Exiting.[/red]")
         return
     
-    console.print(f"[green][+] Loaded {len(accounts)} account(s)[/green]\n")
+    console.print(f"[green][+] Loaded {len(accounts)} account(s)[/green]")
+    console.print(f"[cyan][*] Using {workers} parallel worker(s)[/cyan]\n")
     
     # Show account list
     table = Table(title="Accounts to Process", box=box.ROUNDED)
@@ -917,38 +1068,76 @@ async def main():
     console.print(table)
     console.print()
     
-    # Launch browser (shared for all accounts)
+    # Launch browser(s)
     async with async_playwright() as p:
-        console.print("[bold]Launching browser...[/bold]")
-        browser = await p.chromium.launch(
-            headless=False,  # Show browser
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-sandbox'
-            ]
-        )
+        console.print(f"[bold]Launching {workers} browser(s)...[/bold]")
         
-        results = []
-        
-        # Process each account
-        for idx, (email, password) in enumerate(accounts, 1):
-            # Skip if already has valid token
-            if has_valid_token(email):
-                console.print(f"\n[green][+] Account {idx}/{len(accounts)}: {email} already has valid token. Skipping.[/green]")
-                results.append((email, True))
-                continue
+        if workers == 1:
+            # Single worker mode (original behavior)
+            browser = await p.chromium.launch(
+                headless=args.headless,
+                args=[
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox'
+                ]
+            )
             
-            login = V2FunGoogleLogin(email, password, idx, len(accounts))
-            success = await login.run(browser)
-            results.append((email, success))
+            results = []
             
-            # Wait between accounts
-            if idx < len(accounts):
-                console.print(f"\n[dim]Waiting 5 seconds before next account...[/dim]\n")
-                await asyncio.sleep(5)
+            # Process each account sequentially
+            for idx, (email, password) in enumerate(accounts, 1):
+                if not args.force and has_valid_token(email):
+                    console.print(f"\n[green][+] Account {idx}/{len(accounts)}: {email} already has valid token. Skipping.[/green]")
+                    results.append((email, True))
+                    continue
+                
+                login = V2FunGoogleLogin(email, password, idx, len(accounts))
+                success = await login.run(browser)
+                results.append((email, success))
+                
+                if idx < len(accounts):
+                    console.print(f"\n[dim]Waiting 5 seconds before next account...[/dim]\n")
+                    await asyncio.sleep(5)
+            
+            await browser.close()
         
-        await browser.close()
+        else:
+            # Multi-worker mode
+            browsers = []
+            for i in range(workers):
+                browser = await p.chromium.launch(
+                    headless=args.headless,
+                    args=[
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                        '--no-sandbox',
+                        f'--window-position={i*100},{i*100}'
+                    ]
+                )
+                browsers.append(browser)
+            
+            console.print(f"[green][+] {workers} browsers launched[/green]\n")
+            
+            # Prepare account queue with index
+            account_queue = [(idx+1, email, password) for idx, (email, password) in enumerate(accounts)]
+            results = []
+            semaphore = asyncio.Semaphore(workers)
+            
+            # Launch workers
+            tasks = []
+            for worker_id, browser in enumerate(browsers, 1):
+                task = asyncio.create_task(
+                    process_account_with_worker(browser, account_queue, results, worker_id, semaphore, force=args.force)
+                )
+                tasks.append(task)
+            
+            # Wait for all workers to complete
+            await asyncio.gather(*tasks)
+            
+            # Close all browsers
+            for browser in browsers:
+                await browser.close()
         
         # Summary
         console.print("\n" + "="*80, style="cyan")
@@ -960,8 +1149,18 @@ async def main():
         summary_table.add_column("Email", style="yellow")
         summary_table.add_column("Status", justify="center")
         
+        # Sort results by index if multi-worker
+        if workers > 1:
+            results.sort(key=lambda x: x[0])
+        
         success_count = 0
-        for idx, (email, success) in enumerate(results, 1):
+        for item in results:
+            if workers > 1:
+                idx, email, success = item
+            else:
+                email, success = item
+                idx = results.index(item) + 1
+            
             status = "[green][+] Success[/green]" if success else "[red][!] Failed[/red]"
             summary_table.add_row(str(idx), email, status)
             if success:

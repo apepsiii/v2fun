@@ -22,6 +22,7 @@ class SSEMonitor:
         self.sse_url = f"{self.base_url}/ums/external/sse?token={token}"
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._lock = threading.Lock()
         self._watchers: dict = {}
 
     def watch(
@@ -32,15 +33,16 @@ class SSEMonitor:
         on_error: Optional[Callable] = None
     ):
         """Register a task to watch"""
-        self._watchers[task_uuid] = {
-            "on_update": on_update,
-            "on_done": on_done,
-            "on_error": on_error,
-            "done": False
-        }
-        
-        if self._thread is None or not self._thread.is_alive():
-            self._start()
+        with self._lock:
+            self._watchers[task_uuid] = {
+                "on_update": on_update,
+                "on_done": on_done,
+                "on_error": on_error,
+                "done": False
+            }
+
+            if self._thread is None or not self._thread.is_alive():
+                self._start()
 
     def _start(self):
         """Start SSE listener thread"""
@@ -77,11 +79,15 @@ class SSEMonitor:
                     self._parse_event(event_str)
 
                 # Stop if all watchers are done
-                if self._watchers and all(w["done"] for w in self._watchers.values()):
+                with self._lock:
+                    all_done = bool(self._watchers) and all(w["done"] for w in self._watchers.values())
+                if all_done:
                     break
 
         except Exception as e:
-            for task_uuid, watcher in self._watchers.items():
+            with self._lock:
+                items = list(self._watchers.items())
+            for task_uuid, watcher in items:
                 if not watcher["done"] and watcher.get("on_error"):
                     watcher["on_error"](task_uuid, str(e))
 
@@ -108,12 +114,17 @@ class SSEMonitor:
             data.get("taskuuid")
         )
 
-        for task_uuid, watcher in self._watchers.items():
+        with self._lock:
+            items = list(self._watchers.items())
+
+        for task_uuid, watcher in items:
             if watcher["done"]:
                 continue
 
-            # Match by taskId or broadcast to all
+            # Require matching taskId when event includes one; avoid cross-task broadcast if multiple watchers exist
             if task_id and str(task_id) != str(task_uuid):
+                continue
+            if not task_id and len(items) > 1:
                 continue
 
             status = data.get("status", "").upper()
@@ -131,7 +142,8 @@ class SSEMonitor:
                 })
 
             if status in ("C", "COMPLETED", "DONE", "SUCCESS", "F", "FAILED", "ERROR"):
-                watcher["done"] = True
+                with self._lock:
+                    watcher["done"] = True
                 if watcher.get("on_done"):
                     watcher["on_done"](task_uuid, {
                         "status": status,

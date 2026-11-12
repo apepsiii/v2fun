@@ -4,5 +4,6 @@ rich
 python-dotenv
 requests
 flask
+flask-cors
 werkzeug
 sseclient-py

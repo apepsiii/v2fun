@@ -12,8 +12,10 @@ getresource.md
 # V2Fun sensitive data
 v2fun_data/v2fun_tokens_*.json
 v2fun_data/v2fun_session_*_latest.json
-v2fun_data/v2fun_session_*_latest.json
-v2fun_data/temp_account.txt
+v2fun_data/browser_state_*.json
+v2fun_data/temp_account*.txt
+v2fun_data/temp_refresh_*.txt
+v2fun_data/.flask_secret
 v2fun_data/debug_*.png
 
 # Database

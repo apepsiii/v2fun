@@ -9,7 +9,9 @@ Usage:
 """
 
 import asyncio
+import base64
 import json
+import mimetypes
 import os
 import sys
 import argparse
@@ -23,93 +25,39 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+V2FUN_DATA_DIR = BASE_DIR / "v2fun_data"
+sys.path.insert(0, str(BASE_DIR))
+from v2fun_scripts.v2fun_client import (
+    V2FunClient as BaseV2FunClient,
+    get_session_file_path,
+    extract_token_from_session,
+)
+
 console = Console()
 
 
-class V2FunClient:
-    def __init__(self, token: str):
-        self.base_url = "https://api.prod.v2fun.ai"
-        self.token = token
-        self.headers = {
-            "Authorization": token,
-            "X-Access-Token": token,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Referer": "https://v2fun.ai/"
-        }
-    
+class V2FunClient(BaseV2FunClient):
+    """CLI wrapper around shared V2FunClient with Rich console output."""
+
     def generate_image(self, prompt: str, **kwargs):
-        """Generate image with V2Fun API"""
-        console.print(f"\n[bold]Submitting generation request...[/bold]")
-        
-        payload = {
-            "prompt": prompt,
-            "model": kwargs.get("model", "nano-banana-pro"),
-            "ratio": kwargs.get("ratio", "16:9"),
-            "num": kwargs.get("num", 1),
-            "quality": kwargs.get("quality", "medium")
-        }
-        
-        if kwargs.get("reference_images"):
-            payload["referenceImages"] = kwargs["reference_images"]
-        
+        console.print("\n[bold]Submitting generation request...[/bold]")
         console.print(f"[cyan]Prompt:[/cyan] {prompt[:100]}...")
-        console.print(f"[cyan]Model:[/cyan] {payload['model']}")
-        console.print(f"[cyan]Quality:[/cyan] {payload['quality']}")
-        console.print(f"[cyan]Ratio:[/cyan] {payload['ratio']}")
-        
-        try:
-            response = requests.post(
-                f"{self.base_url}/work/external/generate/image-generate?lan=en",
-                headers=self.headers,
-                json=payload,
-                timeout=30
-            )
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            if result.get("success"):
-                console.print("[green][+] Generation request submitted successfully![/green]")
-                return result.get("result")
-            else:
-                console.print(f"[red][!] API Error: {result.get('message')}[/red]")
-                return None
-                
-        except requests.exceptions.RequestException as e:
-            console.print(f"[red][!] Request failed: {str(e)}[/red]")
-            return None
-    
-    def get_balance(self):
-        """Get user credit balance"""
-        try:
-            response = requests.get(
-                f"{self.base_url}/sys/user/get-balance?lan=en",
-                headers=self.headers,
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()
-        except:
-            return None
-    
-    def get_user_info(self):
-        """Get user login info"""
-        try:
-            response = requests.post(
-                f"{self.base_url}/sys/user/getLoginInfo?lan=en",
-                headers=self.headers,
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()
-        except:
-            return None
+        console.print(f"[cyan]Model:[/cyan] {kwargs.get('model', 'nano-banana-pro')}")
+        console.print(f"[cyan]Quality:[/cyan] {kwargs.get('quality', 'medium')}")
+        console.print(f"[cyan]Ratio:[/cyan] {kwargs.get('ratio', '16:9')}")
+
+        res = super().generate_image(prompt, **kwargs)
+        if res.get("success"):
+            console.print("[green][+] Generation request submitted successfully![/green]")
+            return res.get("result")
+        console.print(f"[red][!] API Error: {res.get('message')}[/red]")
+        return None
 
 
 def load_token_from_session(email: str = None):
     """Load token from saved session file"""
-    v2fun_data = Path("v2fun_data")
+    v2fun_data = V2FUN_DATA_DIR
     
     # Find session files
     if email:
@@ -145,14 +93,17 @@ def load_token_from_session(email: str = None):
 
 
 def upload_reference_image(client: V2FunClient, image_path: str):
-    """Upload reference image to OSS"""
+    """Upload reference image to V2Fun OSS"""
     console.print(f"\n[bold]Uploading reference image...[/bold]")
     console.print(f"[cyan]File:[/cyan] {image_path}")
-    
-    # TODO: Implement OSS upload
-    # For now, return None (will skip reference image)
-    console.print("[yellow][~] Image upload not yet implemented[/yellow]")
-    console.print("[yellow][~] Generating without reference image[/yellow]")
+
+    mime_type, _ = mimetypes.guess_type(image_path)
+    res = client.upload_to_oss(image_path, mime_type=mime_type or "image/jpeg")
+    if res.get("success"):
+        oss_path = res.get("oss_path")
+        console.print(f"[green][+] Uploaded to OSS: {oss_path}[/green]")
+        return oss_path
+    console.print(f"[red][!] Upload error: {res.get('message')}[/red]")
     return None
 
 
@@ -193,7 +144,7 @@ def display_result(result: dict):
     console.print("[yellow][~] Check V2Fun.ai dashboard for generation status[/yellow]")
     
     # Save result
-    output_dir = Path("v2fun_data/generations")
+    output_dir = V2FUN_DATA_DIR / "generations"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -267,8 +218,8 @@ def cmd_generate(args):
 
 def cmd_list_sessions(args):
     """List available sessions"""
-    v2fun_data = Path("v2fun_data")
-    session_files = list(v2fun_data.glob("v2fun_session_*_latest.json"))
+    v2fun_data = V2FUN_DATA_DIR
+    session_files = list(v2fun_data.glob("v2fun_session_*_latest.json")) if v2fun_data.exists() else []
     
     if not session_files:
         console.print("[yellow]No sessions found[/yellow]")
@@ -286,13 +237,23 @@ def cmd_list_sessions(args):
         with open(file, "r", encoding="utf-8") as f:
             session = json.load(f)
         
-        email = session.get("email")
-        timestamp = session.get("timestamp")
+        email = session.get("email") or "N/A"
+        timestamp = session.get("timestamp") or "N/A"
         
-        # Try to extract user ID from token
+        # Try to extract user ID from JWT payload
         tokens = session.get("tokens", {})
-        token = tokens.get("cookie_token", "")
+        token = tokens.get("cookie_token") or tokens.get("localStorage_access_token") or ""
         user_id = "N/A"
+        try:
+            parts = token.split(".")
+            if len(parts) >= 2:
+                payload = parts[1] + "=" * (4 - len(parts[1]) % 4)
+                decoded = json.loads(base64.b64decode(payload))
+                uid = decoded.get("userId") or decoded.get("sub") or decoded.get("id")
+                if uid is not None:
+                    user_id = str(uid)
+        except Exception:
+            pass
         
         table.add_row(str(idx), email, user_id, timestamp)
     
