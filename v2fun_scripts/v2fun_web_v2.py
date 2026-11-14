@@ -458,7 +458,7 @@ def api_generate():
     try:
         result = client.generate_image(
             prompt=prompt,
-            model=data.get("model", "nano-banana-pro"),
+            model=data.get("model", "gpt-image-2.5-sunburst"),
             quality=data.get("quality", "medium"),
             ratio=data.get("ratio", "16:9"),
             num=data.get("num", 1),

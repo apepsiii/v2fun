@@ -27,7 +27,7 @@ class V2FunBackendClient:
         except Exception as e:
             return {"status": "unhealthy", "error": str(e)}
     
-    def generate(self, prompt: str, model: str = "nano-banana-pro", 
+    def generate(self, prompt: str, model: str = "gpt-image-2.5-sunburst", 
                 quality: str = "medium", ratio: str = "16:9") -> Dict:
         """Submit generation request"""
         payload = {
@@ -89,7 +89,7 @@ class V2FunBackendClient:
         print(f"[TIMEOUT] Job {job_id} exceeded {timeout}s timeout")
         return None
     
-    def batch_generate(self, prompts: List[str], model: str = "nano-banana-pro",
+    def batch_generate(self, prompts: List[str], model: str = "gpt-image-2.5-sunburst",
                       wait: bool = True) -> List[Dict]:
         """Generate multiple images"""
         jobs = []
@@ -344,8 +344,10 @@ def example_with_different_models():
     client = V2FunBackendClient()
     
     models = [
-        "nano-banana-pro",
+        "gpt-image-2.5-sunburst",
+        "gpt-image-2.5-flare",
         "gpt-image-2",
+        "nano-banana-pro",
         "nano-banana-2",
         "qwen-edit"
     ]

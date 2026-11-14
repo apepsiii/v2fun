@@ -62,7 +62,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
             prompt TEXT NOT NULL,
-            model TEXT DEFAULT 'nano-banana-pro',
+            model TEXT DEFAULT 'gpt-image-2.5-sunburst',
             quality TEXT DEFAULT 'medium',
             ratio TEXT DEFAULT '16:9',
             num INTEGER DEFAULT 1,
@@ -545,7 +545,7 @@ def create_generation(user_id: int, prompt: str, **kwargs) -> int:
         """, (
             user_id,
             prompt,
-            kwargs.get('model', 'nano-banana-pro'),
+            kwargs.get('model', 'gpt-image-2.5-sunburst'),
             kwargs.get('quality', 'medium'),
             kwargs.get('ratio', '16:9'),
             kwargs.get('num', 1),

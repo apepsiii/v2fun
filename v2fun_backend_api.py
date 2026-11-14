@@ -483,7 +483,7 @@ def generate_image():
     Request Body:
     {
         "prompt": "your prompt here",
-        "model": "nano-banana-pro" (optional, auto-selected by priority),
+        "model": "gpt-image-2.5-sunburst" (optional, auto-selected by priority),
         "quality": "medium" (optional: low/medium/high),
         "ratio": "16:9" (optional: 1:1/16:9/9:16),
         "telegram_token": "..." (optional),
@@ -496,7 +496,7 @@ def generate_image():
         "job_id": "uuid",
         "status": "queued",
         "account": "email@gmail.com",
-        "model": "nano-banana-pro"
+        "model": "gpt-image-2.5-sunburst"
     }
     """
     try:
@@ -1107,8 +1107,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <div class="form-group">
                     <label>Model</label>
                     <select id="model">
-                        <option value="nano-banana-pro">nano-banana-pro (Best)</option>
+                        <option value="gpt-image-2.5-sunburst" selected>gpt-image-2.5-sunburst (Best)</option>
+                        <option value="gpt-image-2.5-flare">gpt-image-2.5-flare</option>
                         <option value="gpt-image-2">gpt-image-2</option>
+                        <option value="nano-banana-pro">nano-banana-pro</option>
                         <option value="nano-banana-2">nano-banana-2</option>
                         <option value="nano-banana-2-lite">nano-banana-2-lite (Fast)</option>
                         <option value="qwen-image">qwen-image (High volume)</option>
@@ -1220,7 +1222,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                 <span class="method-badge method-post">POST</span>
                 <code>/api/generate</code>
                 <p style="font-size:13px;color:#64748b;margin-top:8px">Submit image generation job</p>
-                <div class="code-block">{ "prompt": "string", "model": "nano-banana-pro", "aspect": "1:1" }</div>
+                <div class="code-block">{ "prompt": "string", "model": "gpt-image-2.5-sunburst", "aspect": "1:1" }</div>
             </div>
             <div class="endpoint-card">
                 <span class="method-badge method-get">GET</span>
@@ -1237,7 +1239,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
             <div class="card-title">Example: Generate Image</div>
             <div class="code-block">curl -X POST https://image-gen-v2.gxa.my.id/api/generate \\
   -H "Content-Type: application/json" \\
-  -d '{"prompt": "a cat on the moon", "model": "nano-banana-pro"}'</div>
+  -d '{"prompt": "a cat on the moon", "model": "gpt-image-2.5-sunburst"}'</div>
         </div>
         <div class="card">
             <div class="card-title">Example: Check Status</div>
@@ -1321,8 +1323,8 @@ async function loadDashboard() {
         document.getElementById('statusDot').className = h.status === 'healthy' ? 'status-dot' : 'status-dot offline';
 
         // Model priority list
-        const models = ['nano-banana-pro', 'gpt-image-2', 'nano-banana-2', 'nano-banana-2-lite', 'qwen-image'];
-        const labels = ['Best quality', 'Good alternative', 'Standard', 'Fast', 'High volume (50+)'];
+        const models = ['gpt-image-2.5-sunburst', 'gpt-image-2.5-flare', 'gpt-image-2', 'nano-banana-pro', 'nano-banana-2', 'nano-banana-2-lite', 'qwen-image'];
+        const labels = ['Best quality', 'High quality', 'Good alternative', 'Standard quality', 'Standard', 'Fast', 'High volume (50+)'];
         document.getElementById('modelList').innerHTML = models.map((m, i) => 
             `<div style="display:flex;align-items:center;gap:12px;padding:10px 0;${i < models.length-1 ? 'border-bottom:1px solid var(--color-border)' : ''}">
                 <span style="background:var(--color-muted);color:var(--color-primary);font-weight:700;font-size:12px;width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center">${i+1}</span>

@@ -43,7 +43,7 @@ class V2FunClient(BaseV2FunClient):
     def generate_image(self, prompt: str, **kwargs):
         console.print("\n[bold]Submitting generation request...[/bold]")
         console.print(f"[cyan]Prompt:[/cyan] {prompt[:100]}...")
-        console.print(f"[cyan]Model:[/cyan] {kwargs.get('model', 'nano-banana-pro')}")
+        console.print(f"[cyan]Model:[/cyan] {kwargs.get('model', 'gpt-image-2.5-sunburst')}")
         console.print(f"[cyan]Quality:[/cyan] {kwargs.get('quality', 'medium')}")
         console.print(f"[cyan]Ratio:[/cyan] {kwargs.get('ratio', '16:9')}")
 
@@ -287,7 +287,7 @@ Examples:
     # Generate command
     gen_parser = subparsers.add_parser("generate", help="Generate images")
     gen_parser.add_argument("--prompt", "-p", required=True, help="Text prompt for generation")
-    gen_parser.add_argument("--model", "-m", default="nano-banana-pro", help="Model to use (default: nano-banana-pro)")
+    gen_parser.add_argument("--model", "-m", default="gpt-image-2.5-sunburst", help="Model to use (default: gpt-image-2.5-sunburst)")
     gen_parser.add_argument("--quality", "-q", choices=["low", "medium", "high"], default="medium", help="Quality level")
     gen_parser.add_argument("--ratio", "-r", choices=["1:1", "16:9", "9:16"], default="16:9", help="Aspect ratio")
     gen_parser.add_argument("--num", "-n", type=int, default=1, help="Number of images")

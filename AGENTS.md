@@ -112,10 +112,12 @@ Content-Type: application/json
 ```
 
 ### Models Available
+- `gpt-image-2.5-sunburst` (default)
+- `gpt-image-2.5-flare`
+- `gpt-image-2`
 - `nano-banana-pro`
 - `nano-banana-2`
 - `nano-banana-2-lite`
-- `gpt-image-2`
 - `qwen-image`
 
 ### Image Sizes

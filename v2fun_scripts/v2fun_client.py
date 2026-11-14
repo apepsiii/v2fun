@@ -14,8 +14,10 @@ V2FUN_DATA_DIR = BASE_DIR / "v2fun_data"
 ACCOUNT_FILE = BASE_DIR / "account.txt"
 
 MODEL_PRIORITY = [
-    "nano-banana-pro",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
     "gpt-image-2",
+    "nano-banana-pro",
     "nano-banana-2",
     "nano-banana-2-lite",
     "qwen-image",
@@ -124,7 +126,7 @@ class V2FunClient:
 
         payload = {
             "prompt": prompt.strip(),
-            "model": kwargs.get("model", "nano-banana-pro"),
+            "model": kwargs.get("model", "gpt-image-2.5-sunburst"),
             "ratio": kwargs.get("ratio", "16:9"),
             "num": kwargs.get("num", 1),
             "quality": kwargs.get("quality", "medium"),
