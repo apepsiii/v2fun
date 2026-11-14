@@ -7,6 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <style>
         :root {
             --color-primary: #7C3AED;
@@ -198,6 +199,20 @@
             margin-bottom: var(--space-1);
         }
         .gallery-item-meta { font-size: 11px; color: #94a3b8; }
+        .swal2-popup {
+            font-family: 'DM Sans', sans-serif !important;
+            border-radius: var(--radius-lg, 16px) !important;
+            box-shadow: 0 20px 40px rgba(124, 58, 237, 0.15) !important;
+        }
+        .swal2-title {
+            font-family: 'Space Grotesk', sans-serif !important;
+            font-size: 20px !important;
+            font-weight: 700 !important;
+            color: var(--color-foreground) !important;
+        }
+        .swal2-html-container {
+            font-family: 'DM Sans', sans-serif !important;
+        }
 
         /* Badge */
         .badge {
@@ -873,6 +888,7 @@
     }
 
     let galleryPollTimer = null;
+    let generationsMap = {};
 
     async function loadGallery() {
         const resp = await fetch('/api/generations');
@@ -881,6 +897,7 @@
         if (!data.success) return;
         
         const gens = data.generations || [];
+        gens.forEach(g => { generationsMap[g.id] = g; });
         
         // Update stats
         document.getElementById('statTotal').textContent = gens.length;
@@ -913,10 +930,15 @@
         
         if (!data.success) return;
         const gens = (data.generations || []).slice(0, 4);
+        gens.forEach(g => { generationsMap[g.id] = g; });
         
-        if (gens.length === 0) return;
+        const recentCard = document.getElementById('recentCard');
+        if (gens.length === 0) {
+            if (recentCard) recentCard.style.display = 'none';
+            return;
+        }
         
-        document.getElementById('recentCard').style.display = 'block';
+        if (recentCard) recentCard.style.display = 'block';
         document.getElementById('recentGrid').innerHTML = gens.map(g => renderGalleryItem(g)).join('');
     }
 
@@ -942,9 +964,12 @@
         const date = g.created_at ? new Date(g.created_at).toLocaleDateString() : '';
         
         return `
-            <div class="gallery-item">
-                <div style="width:100%;aspect-ratio:1;background:var(--color-muted);display:flex;align-items:center;justify-content:center;overflow:hidden">
+            <div class="gallery-item" id="gallery-item-${g.id}">
+                <div style="position:relative;width:100%;aspect-ratio:1;background:var(--color-muted);display:flex;align-items:center;justify-content:center;overflow:hidden">
                     ${imageHtml}
+                    <button type="button" onclick="confirmDeleteGeneration(${g.id})" title="Hapus Gambar" style="position:absolute;top:6px;right:6px;width:28px;height:28px;border-radius:50%;background:rgba(220,38,38,0.85);color:white;border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 6px rgba(0,0,0,0.25);transition:all 150ms ease;z-index:5" onmouseover="this.style.background='#dc2626';this.style.transform='scale(1.08)'" onmouseout="this.style.background='rgba(220,38,38,0.85)';this.style.transform='scale(1)'">
+                        <svg width="14" height="14" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                    </button>
                 </div>
                 <div class="gallery-item-info">
                     <div class="gallery-item-prompt" title="${safePrompt}">${safePrompt}</div>
@@ -952,9 +977,77 @@
                         ${statusBadge}
                         <span class="gallery-item-meta">${date}</span>
                     </div>
-                    ${resolvedUrl ? `<div style="display:flex;gap:4px;margin-top:8px"><a href="${safeUrl}" target="_blank" class="btn btn-primary btn-sm" style="flex:1;justify-content:center;font-size:11px;padding:4px 8px">Open</a><a href="${safeUrl}" download class="btn btn-outline btn-sm" style="flex:1;justify-content:center;font-size:11px;padding:4px 8px">Download</a></div>` : ''}
+                    <div style="display:flex;gap:4px;margin-top:8px">
+                        ${resolvedUrl ? `<a href="${safeUrl}" target="_blank" class="btn btn-primary btn-sm" style="flex:1;justify-content:center;font-size:11px;padding:4px 8px">Open</a><a href="${safeUrl}" download class="btn btn-outline btn-sm" style="flex:1;justify-content:center;font-size:11px;padding:4px 8px">Download</a>` : ''}
+                        <button type="button" onclick="confirmDeleteGeneration(${g.id})" class="btn btn-sm" style="background:#fee2e2;color:#dc2626;border:1px solid #fecaca;padding:4px 8px;font-size:11px;display:flex;align-items:center;gap:4px;justify-content:center;${resolvedUrl ? '' : 'flex:1;'}" title="Hapus Gambar">
+                            <svg width="12" height="12" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+                            Delete
+                        </button>
+                    </div>
                 </div>
             </div>`;
+    }
+
+    async function confirmDeleteGeneration(id) {
+        const gen = generationsMap[id] || {};
+        const promptText = gen.prompt || '';
+        
+        let isConfirmed = false;
+        if (typeof Swal !== 'undefined') {
+            const result = await Swal.fire({
+                title: 'Hapus Gambar?',
+                html: `Apakah Anda yakin ingin menghapus gambar ini beserta promptnya?<br><br>
+                       <div style="text-align:left;font-size:12px;font-weight:600;color:#64748b;margin-bottom:4px">Prompt:</div>
+                       <div style="text-align:left;max-height:100px;overflow-y:auto;background:var(--color-muted, #f8fafc);padding:10px;border-radius:8px;border:1px solid var(--color-border, #e2e8f0);font-size:13px;color:var(--color-foreground, #1e293b);word-break:break-word;white-space:pre-wrap">${escapeHtml(promptText) || '<em>Tidak ada prompt</em>'}</div>`,
+                icon: 'warning',
+                showCancelButton: true,
+                confirmButtonColor: '#dc2626',
+                cancelButtonColor: '#64748b',
+                confirmButtonText: 'Ya, Hapus',
+                cancelButtonText: 'Tidak',
+                reverseButtons: true
+            });
+            isConfirmed = result.isConfirmed;
+        } else {
+            isConfirmed = confirm(`Apakah Anda yakin ingin menghapus gambar ini beserta promptnya?\n\nPrompt:\n${promptText}`);
+        }
+
+        if (!isConfirmed) return;
+
+        try {
+            const resp = await fetch(`/api/generations/${id}`, {
+                method: 'DELETE',
+                headers: { 'Content-Type': 'application/json' }
+            });
+            const data = await resp.json();
+
+            if (data.success) {
+                delete generationsMap[id];
+                if (typeof Swal !== 'undefined') {
+                    Swal.fire({
+                        title: 'Berhasil Dihapus!',
+                        text: 'Gambar beserta prompt berhasil dihapus.',
+                        icon: 'success',
+                        timer: 1500,
+                        showConfirmButton: false
+                    });
+                }
+                if (typeof loadGallery === 'function') await loadGallery();
+                if (typeof loadRecentGenerations === 'function') await loadRecentGenerations();
+            } else {
+                if (typeof Swal !== 'undefined') {
+                    Swal.fire('Gagal!', data.message || 'Gagal menghapus gambar.', 'error');
+                } else {
+                    alert(data.message || 'Gagal menghapus gambar.');
+                }
+            }
+        } catch (err) {
+            if (typeof Swal !== 'undefined') {
+                Swal.fire('Error!', err.message || 'Terjadi kesalahan sistem.', 'error');
+            } else {
+                alert('Terjadi kesalahan: ' + err.message);
+            }
+        }
     }
 
     // Handle multiple image uploads (up to 3 slots)

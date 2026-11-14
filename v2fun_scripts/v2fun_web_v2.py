@@ -41,7 +41,7 @@ sys.path.insert(0, str(BASE_DIR))
 from v2fun_scripts.database import (
     init_db, get_db, create_user, verify_user, get_user_by_id,
     update_user_token, create_generation, update_generation_status,
-    get_user_generations, save_uploaded_image,
+    get_user_generations, get_generation_by_id, delete_generation, save_uploaded_image,
     create_session as create_db_session, verify_session as verify_db_session,
     delete_session, cleanup_expired_sessions,
     import_v2fun_account, get_pending_accounts, get_all_v2fun_accounts,
@@ -544,6 +544,41 @@ def api_generations():
     return jsonify({
         "success": True,
         "generations": generations
+    })
+
+
+@app.route('/api/generations/<int:generation_id>', methods=['POST', 'DELETE'])
+@app.route('/api/generations/<int:generation_id>/delete', methods=['POST', 'DELETE'])
+def api_delete_generation(generation_id):
+    """Delete a generation record and local image file if present"""
+    user = get_current_user()
+    if not user:
+        return jsonify({"success": False, "message": "Not authenticated"}), 401
+
+    uid = user.get('user_id') or user.get('id')
+    is_admin = bool(user.get('is_admin'))
+
+    deleted_item = delete_generation(generation_id, user_id=None if is_admin else uid)
+    if not deleted_item:
+        return jsonify({"success": False, "message": "Gambar tidak ditemukan atau akses ditolak"}), 404
+
+    # Remove local file if exists
+    local_path = deleted_item.get('local_path')
+    if local_path:
+        try:
+            p1 = RESULTS_DIR / Path(local_path).name
+            if p1.is_file():
+                p1.unlink()
+            p2 = BASE_DIR / local_path
+            if p2.is_file():
+                p2.unlink()
+        except Exception:
+            pass
+
+    return jsonify({
+        "success": True,
+        "message": "Gambar dan prompt berhasil dihapus",
+        "deleted_id": generation_id
     })
 
 

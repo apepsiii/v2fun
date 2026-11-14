@@ -9,6 +9,7 @@ import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 from werkzeug.security import generate_password_hash, check_password_hash
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -601,6 +602,45 @@ def get_all_generations(limit: int = 50) -> list:
             LIMIT ?
         """, (limit,))
         return [dict(row) for row in cursor.fetchall()]
+
+
+def get_generation_by_id(generation_id: int) -> Optional[dict]:
+    """Get a single generation by ID"""
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, user_id, prompt, model, quality, ratio, num, status, 
+                   result_url, thumbnail_url, local_path, task_uuid, created_at
+            FROM generations
+            WHERE id = ?
+        """, (generation_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def delete_generation(generation_id: int, user_id: int = None) -> Optional[dict]:
+    """Delete a generation record. If user_id is provided, checks ownership."""
+    with db_session() as conn:
+        cursor = conn.cursor()
+        if user_id is not None:
+            cursor.execute("""
+                SELECT id, user_id, prompt, local_path, result_url
+                FROM generations
+                WHERE id = ? AND user_id = ?
+            """, (generation_id, user_id))
+        else:
+            cursor.execute("""
+                SELECT id, user_id, prompt, local_path, result_url
+                FROM generations
+                WHERE id = ?
+            """, (generation_id,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        gen_data = dict(row)
+        cursor.execute("DELETE FROM generations WHERE id = ?", (generation_id,))
+        conn.commit()
+        return gen_data
 
 
 def save_uploaded_image(user_id: int, filename: str, original_filename: str, 

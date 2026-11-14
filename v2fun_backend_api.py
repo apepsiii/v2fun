@@ -809,6 +809,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     <style>
         :root {
             --color-primary: #7C3AED;
@@ -1459,10 +1460,13 @@ async function loadJobs() {
     }
 }
 
+let galleryImagesMap = {};
+
 async function loadGallery() {
     try {
         const data = await apiGet('/api/gallery');
         const images = data.images || [];
+        images.forEach(img => { galleryImagesMap[img.id] = img; });
         
         if (images.length === 0) {
             document.getElementById('galleryGrid').innerHTML = '<p style="color:#94a3b8;text-align:center;padding:20px;grid-column:1/-1">No completed images yet</p>';
@@ -1492,7 +1496,30 @@ function viewImage(jobId, url) {
 }
 
 async function deleteImage(jobId) {
-    if (!confirm('Delete this image? This cannot be undone.')) return;
+    const img = galleryImagesMap[jobId] || {};
+    const promptText = img.prompt || '';
+    
+    let isConfirmed = false;
+    if (typeof Swal !== 'undefined') {
+        const result = await Swal.fire({
+            title: 'Hapus Gambar?',
+            html: `Apakah Anda yakin ingin menghapus gambar ini beserta promptnya?<br><br>
+                   <div style="text-align:left;font-size:12px;font-weight:600;color:#64748b;margin-bottom:4px">Prompt:</div>
+                   <div style="text-align:left;max-height:100px;overflow-y:auto;background:var(--color-muted, #f8fafc);padding:10px;border-radius:8px;border:1px solid var(--color-border, #e2e8f0);font-size:13px;color:var(--color-foreground, #1e293b);word-break:break-word;white-space:pre-wrap">${escapeHtml(promptText) || '<em>Tidak ada prompt</em>'}</div>`,
+            icon: 'warning',
+            showCancelButton: true,
+            confirmButtonColor: '#dc2626',
+            cancelButtonColor: '#64748b',
+            confirmButtonText: 'Ya, Hapus',
+            cancelButtonText: 'Tidak',
+            reverseButtons: true
+        });
+        isConfirmed = result.isConfirmed;
+    } else {
+        isConfirmed = confirm(`Apakah Anda yakin ingin menghapus gambar ini beserta promptnya?\n\nPrompt:\n${promptText}`);
+    }
+
+    if (!isConfirmed) return;
     
     try {
         const response = await fetch(API + '/api/gallery/' + encodeURIComponent(jobId), {
@@ -1502,13 +1529,31 @@ async function deleteImage(jobId) {
         const data = await response.json();
         
         if (data.success) {
+            delete galleryImagesMap[jobId];
+            if (typeof Swal !== 'undefined') {
+                Swal.fire({
+                    title: 'Berhasil Dihapus!',
+                    text: 'Gambar beserta prompt berhasil dihapus.',
+                    icon: 'success',
+                    timer: 1500,
+                    showConfirmButton: false
+                });
+            }
             showAlert('alert-gallery', 'Image deleted successfully', 'success');
             loadGallery();
         } else {
-            showAlert('alert-gallery', 'Failed to delete: ' + (data.error || 'Unknown error'), 'error');
+            if (typeof Swal !== 'undefined') {
+                Swal.fire('Gagal!', data.error || 'Gagal menghapus gambar.', 'error');
+            } else {
+                showAlert('alert-gallery', 'Failed to delete: ' + (data.error || 'Unknown error'), 'error');
+            }
         }
     } catch (err) {
-        showAlert('alert-gallery', 'Error: ' + err.message, 'error');
+        if (typeof Swal !== 'undefined') {
+            Swal.fire('Error!', err.message || 'Terjadi kesalahan.', 'error');
+        } else {
+            showAlert('alert-gallery', 'Error: ' + err.message, 'error');
+        }
     }
 }
 
